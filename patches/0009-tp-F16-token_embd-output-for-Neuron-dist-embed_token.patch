@@ -1,0 +1,266 @@
+From eec6bf3d34d6932791c5d0d9e1bec9c3a183c397 Mon Sep 17 00:00:00 2001
+From: Hermes <hermes@local>
+Date: Fri, 7 Aug 2026 20:01:35 -0700
+Subject: [PATCH 09/12] tp: F16 token_embd/output for Neuron + dist embed_token
+
+Neuron IQ1_S GGUF uses GGML F16 (type 1) token_embd and output rows.
+Distributed embed_token only accepted F32/Q8_0, so 3-Spark forward failed
+immediately with embed_token failed after successful 3/3 load.
+
+Fold in the known F16 boundary kernels (row dequant + dense proj) and
+teach dist/TP/single-GPU embed row sizing type==1. LM head uses k3_proj_f32
+which now accepts wtype 1.
+---
+ kernels/csrc/cuda/kimi_k3/k3_kernels.cu     | 60 ++++++++++++++++++++-
+ kernels/tests/kimi_k3_proj_gemv_test.cu     | 29 ++++++++++
+ kernels/tests/kimi_k3_row_dequant_test.cu   | 13 +++++
+ runtime/src/models/kimi_k3.cpp              |  3 ++
+ runtime/src/models/kimi_k3_dist_forward.cpp |  4 ++
+ runtime/src/models/kimi_k3_tp.cpp           |  2 +
+ 6 files changed, 110 insertions(+), 1 deletion(-)
+
+diff --git a/kernels/csrc/cuda/kimi_k3/k3_kernels.cu b/kernels/csrc/cuda/kimi_k3/k3_kernels.cu
+index 0759b24..e8addf3 100644
+--- a/kernels/csrc/cuda/kimi_k3/k3_kernels.cu
++++ b/kernels/csrc/cuda/kimi_k3/k3_kernels.cu
+@@ -4066,6 +4066,14 @@ __global__ void dequant_f32_passthrough_kernel(float* __restrict__ out,
+     if (i < n) out[i] = src[i];
+ }
+ 
++__global__ void dequant_f16_kernel(float* __restrict__ out,
++                                   const __half* __restrict__ src,
++                                   int64_t n) {
++    k3_pdl_sync();
++    const int64_t i = blockIdx.x * (int64_t)blockDim.x + threadIdx.x;
++    if (i < n) out[i] = __half2float(src[i]);
++}
++
+ template <int BLOCK>
+ __global__ void proj_f32_kernel(float* __restrict__ y, const float* __restrict__ x,
+                                 const float* __restrict__ W, int K) {
+@@ -4103,6 +4111,30 @@ __global__ void proj_f32_kernel(float* __restrict__ y, const float* __restrict__
+     if (threadIdx.x == 0) y[n] = acc;
+ }
+ 
++template <int BLOCK>
++__global__ void proj_f16_kernel(float* __restrict__ y, const float* __restrict__ x,
++                                const __half* __restrict__ W, int K) {
++    k3_pdl_sync();
++    const int n = blockIdx.x;
++    const __half* row = W + (size_t)n * K;
++    __shared__ float shm[BLOCK / 32 + 1];
++    float acc = 0.0f;
++    int k = threadIdx.x;
++    for (; k + 7 * BLOCK < K; k += 8 * BLOCK) {
++        float w[8], v[8];
++#pragma unroll
++        for (int u = 0; u < 8; ++u) {
++            w[u] = __half2float(row[k + u * BLOCK]);
++            v[u] = x[k + u * BLOCK];
++        }
++#pragma unroll
++        for (int u = 0; u < 8; ++u) acc += w[u] * v[u];
++    }
++    for (; k < K; k += BLOCK) acc += __half2float(row[k]) * x[k];
++    acc = block_sum<BLOCK>(acc, shm);
++    if (threadIdx.x == 0) y[n] = acc;
++}
++
+ 
+ // ROW AXIS (blockIdx.y). ALL THREE operands are row-major activations and all three are
+ // offset — this entry point is the residual combine, not a broadcast bias add. A caller
+@@ -4913,6 +4945,14 @@ bool dequant_f32_by_type(float* out, const void* src, int64_t n, int ggml_type,
+                 out, (const float*)src, n);
+             return true;
+         }
++        case 1: {  // F16 — public release token embedding/output rows
++            if (n <= 0) return false;
++            const int T = 256;
++            const int64_t blocks = (n + T - 1) / T;
++            k3_pdl_launch((unsigned)blocks, T, 0, stream, dequant_f16_kernel,
++                out, (const __half*)src, n);
++            return true;
++        }
+         case 8: {  // Q8_0 — the other type token_embd.weight / output.weight may use
+             if (n <= 0 || n % 32 != 0) return false;
+             const int64_t n_blocks = n / 32;
+@@ -5881,6 +5921,24 @@ bool k3_proj_f32(float* y, const float* x, const void* W, int wtype,
+                     return true;
+             }
+         }
++        case 1: {  // F16, dense (public release embedding / LM head)
++            const int blk = (N > 64 || K < 1024) ? 128
++                          : (K >= 4096 ? 1024 : 512);
++            switch (blk) {
++                case 1024:
++                    k3_pdl_launch((unsigned)N, 1024, 0, stream, proj_f16_kernel<1024>,
++                        y, x, (const __half*)W, K);
++                    return true;
++                case 512:
++                    k3_pdl_launch((unsigned)N, 512, 0, stream, proj_f16_kernel<512>,
++                        y, x, (const __half*)W, K);
++                    return true;
++                default:
++                    k3_pdl_launch((unsigned)N, BLOCK, 0, stream, proj_f16_kernel<BLOCK>,
++                        y, x, (const __half*)W, K);
++                    return true;
++            }
++        }
+         case 8: {  // Q8_0
+             if (K % 32 != 0) return false;
+             // Multi-row amortises the activation re-read, but it also divides the grid
+@@ -6338,7 +6396,7 @@ bool k3_quantize_act_rows_f32(void* q8_out, const float* x, int K, int n_tok,
+ bool k3_proj_ggml_f32(float* y, const float* x, const void* W, int wtype,
+                       int N, int K, void* q8_scratch, cudaStream_t stream) {
+     if (N <= 0 || K <= 0) return false;
+-    if (wtype == 0)
++    if (wtype == 0 || wtype == 1)
+         return k3_proj_f32(y, x, W, wtype, N, K, stream);
+     if (wtype != 8 || !q8_scratch || K % 32 != 0) return false;
+     if (!k3_quantize_act_f32(q8_scratch, x, K, stream)) return false;
+diff --git a/kernels/tests/kimi_k3_proj_gemv_test.cu b/kernels/tests/kimi_k3_proj_gemv_test.cu
+index de2e2a0..34304d3 100644
+--- a/kernels/tests/kimi_k3_proj_gemv_test.cu
++++ b/kernels/tests/kimi_k3_proj_gemv_test.cu
+@@ -371,6 +371,35 @@ int main() {
+         cudaFree(dW); cudaFree(dx); cudaFree(dy);
+     }
+ 
++    // ---- F16 dense case (public release token embedding / LM head type) ----
++    {
++        const int N = 203, K = 385;
++        std::vector<uint16_t> W((size_t)N * K);
++        std::vector<float> x(K);
++        for (auto& h : W) h = __half_as_ushort(__float2half_rn(U(rng)));
++        for (auto& v : x) v = U(rng);
++        std::vector<double> ref(N, 0.0);
++        for (int n = 0; n < N; ++n) {
++            double acc = 0;
++            for (int k = 0; k < K; ++k)
++                acc += (double)h2f(W[(size_t)n*K+k]) * (double)x[k];
++            ref[n] = acc;
++        }
++        void *dW, *dx, *dy;
++        CU(cudaMalloc(&dW, W.size()*2)); CU(cudaMalloc(&dx, K*4)); CU(cudaMalloc(&dy, N*4));
++        CU(cudaMemcpy(dW, W.data(), W.size()*2, cudaMemcpyHostToDevice));
++        CU(cudaMemcpy(dx, x.data(), K*4, cudaMemcpyHostToDevice));
++        const bool ok = k3_proj_f32((float*)dy, (const float*)dx, dW, /*wtype=*/1, N, K, 0);
++        CU(cudaDeviceSynchronize());
++        std::vector<float> got(N); CU(cudaMemcpy(got.data(), dy, N*4, cudaMemcpyDeviceToHost));
++        double num=0, den=0;
++        for (int n=0;n<N;++n){ const double d=got[n]-ref[n]; num+=d*d; den+=ref[n]*ref[n]; }
++        const double rl2=std::sqrt(num/(den+1e-30));
++        std::printf("[F16]  N=%d K=%d accepted=%s relL2=%.3e\n",N,K,ok?"yes":"NO",rl2);
++        if(!ok||rl2>1e-5) ++fail;
++        cudaFree(dW); cudaFree(dx); cudaFree(dy);
++    }
++
+     // ---- unsupported type must be refused ----
+     {
+         float *dy=nullptr, *dx=nullptr; void* dW=nullptr;
+diff --git a/kernels/tests/kimi_k3_row_dequant_test.cu b/kernels/tests/kimi_k3_row_dequant_test.cu
+index 2c4989a..fb3c880 100644
+--- a/kernels/tests/kimi_k3_row_dequant_test.cu
++++ b/kernels/tests/kimi_k3_row_dequant_test.cu
+@@ -1,5 +1,6 @@
+ #include "sparkinfer/kernels/kimi_k3.h"
+ #include <cuda_runtime.h>
++#include <cuda_fp16.h>
+ #include <cmath>
+ #include <cstdio>
+ #include <cstring>
+@@ -38,6 +39,18 @@ int main(){
+     std::printf("[F32 row] accepted=%s bit-identical=%s\n", ok?"yes":"NO", same?"yes":"NO");
+     if(!ok||!same) ++fail;
+   }
++  // F16 row dequant: the public 330 GB release uses F16 token_embd/output rows.
++  { const int K=513; std::vector<uint16_t> row(K); std::vector<float> ref(K);
++    for(int i=0;i<K;++i){ const float v=(float)((int)(rng()%2001)-1000)/37.0f;
++      const __half h=__float2half_rn(v); row[i]=__half_as_ushort(h); ref[i]=__half2float(h); }
++    void* d; CU(cudaMalloc(&d,K*2)); CU(cudaMemcpy(d,row.data(),K*2,cudaMemcpyHostToDevice));
++    float* dout; CU(cudaMalloc(&dout,K*4));
++    bool ok=dequant_f32_by_type(dout,d,K,1,0); CU(cudaDeviceSynchronize());
++    std::vector<float> got(K); CU(cudaMemcpy(got.data(),dout,K*4,cudaMemcpyDeviceToHost));
++    bool same=true; for(int i=0;i<K;++i) if(got[i]!=ref[i]) same=false;
++    std::printf("[F16 row] accepted=%s bit-identical=%s\n",ok?"yes":"NO",same?"yes":"NO");
++    if(!ok||!same) ++fail; cudaFree(d); cudaFree(dout);
++  }
+   std::printf("\n%s\n", fail?"FAIL":"PASS");
+   return fail?1:0;
+ }
+diff --git a/runtime/src/models/kimi_k3.cpp b/runtime/src/models/kimi_k3.cpp
+index 93f695f..e48d794 100644
+--- a/runtime/src/models/kimi_k3.cpp
++++ b/runtime/src/models/kimi_k3.cpp
+@@ -10,6 +10,7 @@
+ #include <cstdio>
+ #include <cstring>
+ #include <cstdlib>
++#include <cstdint>
+ #include <set>
+ #include <mutex>
+ #include <utility>
+@@ -3592,6 +3593,7 @@ bool kimi_k3_forward_token(KimiK3Forward& fwd, int token_id, float* out_logits)
+         // token_id * row_bytes(hidden, wtype).
+         long row_bytes = 0;
+         if (w.token_embd.type == 0) row_bytes = (long)H * sizeof(float);
++        else if (w.token_embd.type == 1) row_bytes = (long)H * sizeof(uint16_t);
+         else if (w.token_embd.type == 8) row_bytes = (long)(H / 32) * 34;
+         else ok = false;
+         if (ok) {
+@@ -3769,6 +3771,7 @@ bool kimi_k3_pipeline_forward_token(KimiK3Pipeline& p, int token_id, float* out_
+         long row_bytes = 0;
+         const int ty = s0.weights.token_embd.type;
+         if (ty == 0) row_bytes = (long)H * sizeof(float);
++        else if (ty == 1) row_bytes = (long)H * sizeof(uint16_t);
+         else if (ty == 8) row_bytes = (long)(H / 32) * 34;
+         else return false;
+         const char* base = (const char*)s0.weights.token_embd.data +
+diff --git a/runtime/src/models/kimi_k3_dist_forward.cpp b/runtime/src/models/kimi_k3_dist_forward.cpp
+index 0c78ea9..3003dcb 100755
+--- a/runtime/src/models/kimi_k3_dist_forward.cpp
++++ b/runtime/src/models/kimi_k3_dist_forward.cpp
+@@ -2,6 +2,7 @@
+ 
+ #include "sparkinfer/kernels/kimi_k3.h"
+ 
++#include <cstdint>
+ #include <cstdio>
+ #include <cstring>
+ #include <vector>
+@@ -18,9 +19,12 @@ void set_err(std::string* error, const std::string& v) {
+ bool embed_token(const KimiK3Weights& w, const KimiK3Config& cfg, int token_id,
+                  float* x, cudaStream_t stream) {
+     if (!w.token_embd.ok()) return false;
++    // Mirror single-GPU / TP embed: F32, F16 (Neuron release), Q8_0.
+     long row_bytes = 0;
+     if (w.token_embd.type == 0)
+         row_bytes = (long)cfg.hidden * sizeof(float);
++    else if (w.token_embd.type == 1)
++        row_bytes = (long)cfg.hidden * sizeof(uint16_t);
+     else if (w.token_embd.type == 8)
+         row_bytes = (long)(cfg.hidden / 32) * 34;
+     else
+diff --git a/runtime/src/models/kimi_k3_tp.cpp b/runtime/src/models/kimi_k3_tp.cpp
+index b09a8e1..7ba8bc4 100644
+--- a/runtime/src/models/kimi_k3_tp.cpp
++++ b/runtime/src/models/kimi_k3_tp.cpp
+@@ -12,6 +12,7 @@
+ #include <chrono>
+ #include <cstdio>
+ #include <cstdlib>
++#include <cstdint>
+ #include <map>
+ #include <vector>
+ #include <string>
+@@ -123,6 +124,7 @@ bool embed_token(const KimiK3Weights& w, const KimiK3Config& cfg, int token_id,
+     if (!w.token_embd.ok()) return false;
+     long row_bytes = 0;
+     if (w.token_embd.type == 0)      row_bytes = (long)cfg.hidden * sizeof(float);
++    else if (w.token_embd.type == 1) row_bytes = (long)cfg.hidden * sizeof(uint16_t);
+     else if (w.token_embd.type == 8) row_bytes = (long)(cfg.hidden / 32) * 34;
+     else return false;
+     const char* base = (const char*)w.token_embd.data + (size_t)token_id * row_bytes;
+-- 
+2.43.0
+

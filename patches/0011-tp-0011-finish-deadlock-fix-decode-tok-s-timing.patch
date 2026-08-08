@@ -1,0 +1,172 @@
+From 09776130b5e2903c0906b6e45ea5c6de647756cb Mon Sep 17 00:00:00 2001
+From: Hermes <hermes@local>
+Date: Fri, 7 Aug 2026 23:19:09 -0700
+Subject: [PATCH 11/12] tp: 0011 finish deadlock fix + decode tok/s timing
+
+finish() held mu_ while waiting for FinishAcks, deadlocking rx_loop;
+inject rank0 FinishAck once and wait unlocked. Add fflush'd prefill/decode
+tok/s lines and generated_ids for Spark TPS measurement.
+---
+ runtime/examples/kimi_k3_dist_generate.cpp | 44 ++++++++++++--
+ runtime/src/tp/rank_transport_tcp.cpp      | 69 ++++++++++++++++------
+ 2 files changed, 91 insertions(+), 22 deletions(-)
+
+diff --git a/runtime/examples/kimi_k3_dist_generate.cpp b/runtime/examples/kimi_k3_dist_generate.cpp
+index 1a197c4..b1b93c3 100644
+--- a/runtime/examples/kimi_k3_dist_generate.cpp
++++ b/runtime/examples/kimi_k3_dist_generate.cpp
+@@ -302,27 +302,63 @@ int main(int argc, char** argv) {
+             return true;
+         };
+ 
++        using clock = std::chrono::steady_clock;
++        const auto t_prefill0 = clock::now();
+         for (size_t i = 0; i < prompt.size(); ++i) {
+             float* lp = (i + 1 == prompt.size()) ? logits.data() : nullptr;
+             if (!one_step(prompt[i], lp)) return 1;
+         }
+-        std::printf("prefill done (%zu toks). generating %d...\n", prompt.size(), n_predict);
++        const auto t_prefill1 = clock::now();
++        const double prefill_s =
++            std::chrono::duration<double>(t_prefill1 - t_prefill0).count();
++        std::printf("prefill done (%zu toks) in %.3fs\n", prompt.size(), prefill_s);
++        std::fflush(stdout);
++        std::fprintf(stderr,
++                     "[k3-dist][tps] prefill_tokens=%zu prefill_s=%.6f prefill_tok_s=%.4f\n",
++                     prompt.size(), prefill_s,
++                     prefill_s > 0 ? (double)prompt.size() / prefill_s : 0.0);
++        std::fflush(stderr);
+ 
+         std::vector<int> generated;
++        const auto t_gen0 = clock::now();
+         for (int n = 0; n < n_predict; ++n) {
+             const int next = kimi_k3_dist_argmax(logits.data(), dist.cfg.vocab);
+             generated.push_back(next);
+             std::printf(" gen[%d]=%d\n", n, next);
++            std::fflush(stdout);
++            {
++                char buf[96];
++                std::snprintf(buf, sizeof(buf), "rank0 gen[%d]=%d", n, next);
++                gen_trace(buf);
++            }
+             if (!one_step(next, logits.data())) return 1;
+         }
++        const auto t_gen1 = clock::now();
++        const double gen_s = std::chrono::duration<double>(t_gen1 - t_gen0).count();
++        // Decode TPS: n_predict forward steps after first logits (each step emits one token).
++        const double decode_tps = gen_s > 0 ? (double)n_predict / gen_s : 0.0;
++        std::printf("OK generated %zu tokens in %.3fs (decode_tok_s=%.4f)\n", generated.size(),
++                    gen_s, decode_tps);
++        std::fflush(stdout);
++        std::fprintf(stderr,
++                     "[k3-dist][tps] decode_tokens=%d decode_s=%.6f decode_tok_s=%.4f\n",
++                     n_predict, gen_s, decode_tps);
++        std::fprintf(stderr, "[k3-dist][tps] generated_ids=");
++        for (size_t i = 0; i < generated.size(); ++i) {
++            std::fprintf(stderr, "%s%d", i ? "," : "", generated[i]);
++        }
++        std::fprintf(stderr, "\n");
++        std::fflush(stderr);
++        gen_trace("rank0 finish enter");
+ 
+         if (!ctr.finish(&err)) {
+             std::fprintf(stderr, "finish: %s\n", err.c_str());
++            std::fflush(stderr);
+             return 1;
+         }
+-        // Best-effort local finish ack (finish() waits on workers + rx thread).
+-        ctr.complete_local_finish_ack(nullptr);
+-        std::printf("OK generated %zu tokens\n", generated.size());
++        gen_trace("rank0 finish ok");
++        std::printf("OK finished clean\n");
++        std::fflush(stdout);
+         kimi_k3_dist_rank_free(&dist);
+         return 0;
+     }
+diff --git a/runtime/src/tp/rank_transport_tcp.cpp b/runtime/src/tp/rank_transport_tcp.cpp
+index e4913bd..6118a30 100644
+--- a/runtime/src/tp/rank_transport_tcp.cpp
++++ b/runtime/src/tp/rank_transport_tcp.cpp
+@@ -715,28 +715,61 @@ bool CoordinatorTransport::begin_step(int token_id, std::string* error) {
+ }
+ 
+ bool CoordinatorTransport::finish(std::string* error) {
+-    std::lock_guard<std::mutex> lock(mu_);
+-    std::vector<Message> outbound;
+-    if (!coord_.finish(&outbound, error)) return false;
+-    if (!dispatch_outbound(outbound, error)) return false;
+-    // Wait finish acks via rx thread + pump.
++    // Do NOT hold mu_ across the wait — rx_loop needs mu_ to accept worker FinishAcks.
++    {
++        std::lock_guard<std::mutex> lock(mu_);
++        std::vector<Message> outbound;
++        if (!coord_.finish(&outbound, error)) return false;
++        if (!dispatch_outbound(outbound, error)) return false;
++
++        // Inject rank0 FinishAck once (same pattern as LoadReady / StepDone).
++        Message ack;
++        ack.type = MessageType::FinishAck;
++        ack.session_id = cluster_.session_id;
++        ack.sequence = coord_.next_sequence();
++        ack.rank = 0;
++        ack.world_size = cluster_.world_size;
++        ack.local_device = cluster_.local_device;
++        ack.n_experts = cluster_.n_experts;
++        ack.moe_ffn = cluster_.moe_ffn;
++        ack.expert_block_elems = cluster_.expert_block_elems;
++        ack.vocab = cluster_.vocab;
++        ack.model_digest = cluster_.model_digest;
++        ack.plan_digest = cluster_.plan_digest;
++        ack.phase = Phase::Shutdown;
++        ack.status = 0;
++        std::vector<Message> ack_out;
++        AuthenticatedPeer ap{0, conn_ids_.empty() ? 1ULL : conn_ids_[0]};
++        if (!coord_.accept(ap, ack, &ack_out, error)) return false;
++        if (!dispatch_outbound(ack_out, error)) return false;
++    }
++
+     const auto deadline = std::chrono::steady_clock::now() + cfg_.phase_timeout;
+-    while (coord_.state() != CoordinatorState::Finished && coord_.good()) {
+-        if (std::chrono::steady_clock::now() > deadline) {
+-            set_err(error, "finish timeout");
+-            return false;
++    while (true) {
++        {
++            std::lock_guard<std::mutex> lock(mu_);
++            if (coord_.state() == CoordinatorState::Finished) {
++                stop_ = true;
++                return true;
++            }
++            if (!coord_.good()) {
++                set_err(error, coord_.failure().empty() ? "finish failed" : coord_.failure());
++                stop_ = true;
++                return false;
++            }
++            if (!last_error_.empty()) {
++                set_err(error, last_error_);
++                stop_ = true;
++                return false;
++            }
++            if (std::chrono::steady_clock::now() > deadline) {
++                set_err(error, "finish timeout");
++                stop_ = true;
++                return false;
++            }
+         }
+-        // Rank-0 FinishAck is injected by the full distributed runtime once it
+-        // owns a local RankSession; this transport milestone relies on workers
+-        // plus the rx thread for remote acks.
+         std::this_thread::sleep_for(std::chrono::milliseconds(5));
+-        if (!last_error_.empty()) {
+-            set_err(error, last_error_);
+-            return false;
+-        }
+     }
+-    stop_ = true;
+-    return coord_.state() == CoordinatorState::Finished;
+ }
+ 
+ bool CoordinatorTransport::fail(const std::string& detail, std::string* error) {
+-- 
+2.43.0
+

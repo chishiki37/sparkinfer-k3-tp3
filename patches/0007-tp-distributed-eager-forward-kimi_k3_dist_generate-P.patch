@@ -1,0 +1,910 @@
+From 645b612cb134fe5a230774fe5268f9dc92b3353b Mon Sep 17 00:00:00 2001
+From: Hermes <hermes@local>
+Date: Fri, 7 Aug 2026 11:23:22 -0700
+Subject: [PATCH 07/12] tp: distributed eager forward + kimi_k3_dist_generate
+ (Phase 3)
+
+- kimi_k3_dist_forward_token: single-rank TP step via RankCollective allreduce
+- kimi_k3_dist_generate: TCP coordinator/workers, NCCL InitRank, greedy sample
+- CoordinatorTransport::complete_local_step/finish_ack for rank0 in-process acks
+- CPU protocol dry-run test (6 checks)
+
+Still experimental: full multi-Spark weight load + generate needs NCCL build and
+330GB on each host. Graphs/WEPS off. No tok/s claim.
+---
+ runtime/CMakeLists.txt                        |   6 +-
+ runtime/examples/kimi_k3_dist_generate.cpp    | 346 ++++++++++++++++++
+ .../sparkinfer/models/kimi_k3_dist_forward.h  |  44 +++
+ .../sparkinfer/models/kimi_k3_dist_rank.h     |   1 +
+ .../include/sparkinfer/tp/rank_transport.h    |   7 +
+ runtime/src/models/kimi_k3_dist_forward.cpp   | 248 +++++++++++++
+ runtime/src/models/kimi_k3_dist_rank.cpp      |   1 +
+ runtime/src/tp/rank_transport_tcp.cpp         |  61 +++
+ runtime/tests/CMakeLists.txt                  |  11 +
+ .../tp_dist_generate_protocol_cpu_test.cpp    |  65 ++++
+ 10 files changed, 789 insertions(+), 1 deletion(-)
+ create mode 100755 runtime/examples/kimi_k3_dist_generate.cpp
+ create mode 100755 runtime/include/sparkinfer/models/kimi_k3_dist_forward.h
+ create mode 100755 runtime/src/models/kimi_k3_dist_forward.cpp
+ create mode 100755 runtime/tests/tp_dist_generate_protocol_cpu_test.cpp
+
+diff --git a/runtime/CMakeLists.txt b/runtime/CMakeLists.txt
+index d3112fc..53058b7 100644
+--- a/runtime/CMakeLists.txt
++++ b/runtime/CMakeLists.txt
+@@ -164,7 +164,11 @@ if(BUILD_EXAMPLES)
+     set_target_properties(kimi_k3_tp_bench PROPERTIES CXX_STANDARD 17)
+ 
+     # End-to-end TP decode vs single-GPU decode.
+-    add_executable(kimi_k3_tp_check examples/kimi_k3_tp_check.cpp)
++        add_executable(kimi_k3_dist_generate examples/kimi_k3_dist_generate.cpp)
++    target_link_libraries(kimi_k3_dist_generate PRIVATE sparkinfer_runtime CUDA::cudart Threads::Threads)
++    set_target_properties(kimi_k3_dist_generate PROPERTIES CXX_STANDARD 17)
++
++add_executable(kimi_k3_tp_check examples/kimi_k3_tp_check.cpp)
+     target_link_libraries(kimi_k3_tp_check PRIVATE sparkinfer_runtime CUDA::cudart)
+     set_target_properties(kimi_k3_tp_check PROPERTIES CXX_STANDARD 17)
+ 
+diff --git a/runtime/examples/kimi_k3_dist_generate.cpp b/runtime/examples/kimi_k3_dist_generate.cpp
+new file mode 100755
+index 0000000..5ed30be
+--- /dev/null
++++ b/runtime/examples/kimi_k3_dist_generate.cpp
+@@ -0,0 +1,346 @@
++// kimi_k3_dist_generate — multi-Spark (one process per rank) greedy decode.
++//
++//   Rank 0: TCP coordinator + sample + begin_step + local forward
++//   Ranks 1..W-1: workers (NCCL InitRank + load + wait_token loop)
++//
++// Build with -DSPARKINFER_TP=ON (NCCL). Protocol-only: --dry-protocol.
++//
++// Usage:
++//   # rank 0
++//   kimi_k3_dist_generate --rank 0 --world 3 --listen 0.0.0.0:29500 \
++//       --model /path/k3-00001-of-00009.gguf --prompt-ids 1,2,3 --n-predict 8
++//   # rank r
++//   kimi_k3_dist_generate --rank r --world 3 --coord HOST:29500 \
++//       --model /path/k3-00001-of-00009.gguf
++
++#include "sparkinfer/models/kimi_k3_dist_forward.h"
++#include "sparkinfer/models/kimi_k3_dist_rank.h"
++#include "sparkinfer/tp/rank_protocol.h"
++#include "sparkinfer/tp/rank_transport.h"
++
++#include <atomic>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <fstream>
++#include <sstream>
++#include <string>
++#include <thread>
++#include <vector>
++
++using namespace sparkinfer;
++using namespace sparkinfer::tp::dist;
++
++namespace {
++
++void usage(const char* argv0) {
++    std::fprintf(stderr,
++                 "usage: %s --rank R --world 3|4 (--listen HOST:PORT | --coord HOST:PORT)\n"
++                 "          --model FIRST.gguf [--prompt-ids 1,2,3] [--prompt-ids-file F]\n"
++                 "          [--n-predict N] [--max-ctx N] [--device 0]\n"
++                 "          [--session-id N] [--dry-protocol]\n",
++                 argv0);
++}
++
++bool parse_host_port(const std::string& s, std::string* host, uint16_t* port) {
++    const auto pos = s.rfind(':');
++    if (pos == std::string::npos || pos == 0 || pos + 1 >= s.size()) return false;
++    *host = s.substr(0, pos);
++    *port = (uint16_t)std::atoi(s.c_str() + pos + 1);
++    return *port != 0;
++}
++
++std::vector<int> parse_ids_csv(const std::string& csv) {
++    std::vector<int> out;
++    std::stringstream ss(csv);
++    std::string item;
++    while (std::getline(ss, item, ',')) {
++        if (!item.empty()) out.push_back(std::atoi(item.c_str()));
++    }
++    return out;
++}
++
++std::vector<int> load_ids_file(const std::string& path) {
++    std::ifstream in(path);
++    std::vector<int> out;
++    int v;
++    while (in >> v) out.push_back(v);
++    return out;
++}
++
++void fill_digests(RankSpec* spec) {
++    const std::string mid = "Kimi-K3-Neuron-IQ1S-GGUF";
++    const std::string pid = plan_identity_string(spec->world_size);
++    for (size_t i = 0; i < mid.size() && i < spec->model_digest.size(); ++i)
++        spec->model_digest[i] = (unsigned char)mid[i];
++    for (size_t i = 0; i < pid.size() && i < spec->plan_digest.size(); ++i)
++        spec->plan_digest[i] = (unsigned char)pid[i];
++    if (!spec->model_digest[0]) spec->model_digest[0] = 0xA5;
++    if (!spec->plan_digest[0]) spec->plan_digest[0] = 0x5A;
++}
++
++}  // namespace
++
++int main(int argc, char** argv) {
++    int rank = -1, world = 3, device = 0, n_predict = 8, max_ctx = 8192;
++    std::uint64_t session_id = 1;
++    std::string model, listen, coord, prompt_csv, prompt_file;
++    bool dry_protocol = false;
++
++    for (int i = 1; i < argc; ++i) {
++        auto need = [&](const char* flag) -> const char* {
++            if (i + 1 >= argc) {
++                std::fprintf(stderr, "missing value for %s\n", flag);
++                std::exit(2);
++            }
++            return argv[++i];
++        };
++        if (!std::strcmp(argv[i], "--rank")) rank = std::atoi(need("--rank"));
++        else if (!std::strcmp(argv[i], "--world")) world = std::atoi(need("--world"));
++        else if (!std::strcmp(argv[i], "--device")) device = std::atoi(need("--device"));
++        else if (!std::strcmp(argv[i], "--model")) model = need("--model");
++        else if (!std::strcmp(argv[i], "--listen")) listen = need("--listen");
++        else if (!std::strcmp(argv[i], "--coord")) coord = need("--coord");
++        else if (!std::strcmp(argv[i], "--prompt-ids")) prompt_csv = need("--prompt-ids");
++        else if (!std::strcmp(argv[i], "--prompt-ids-file"))
++            prompt_file = need("--prompt-ids-file");
++        else if (!std::strcmp(argv[i], "--n-predict")) n_predict = std::atoi(need("--n-predict"));
++        else if (!std::strcmp(argv[i], "--max-ctx")) max_ctx = std::atoi(need("--max-ctx"));
++        else if (!std::strcmp(argv[i], "--session-id"))
++            session_id = (std::uint64_t)std::strtoull(need("--session-id"), nullptr, 10);
++        else if (!std::strcmp(argv[i], "--dry-protocol")) dry_protocol = true;
++        else if (!std::strcmp(argv[i], "-h") || !std::strcmp(argv[i], "--help")) {
++            usage(argv[0]);
++            return 0;
++        } else {
++            std::fprintf(stderr, "unknown arg: %s\n", argv[i]);
++            usage(argv[0]);
++            return 2;
++        }
++    }
++
++    if (rank < 0 || (world != 3 && world != 4) || rank >= world) {
++        usage(argv[0]);
++        return 2;
++    }
++    if (!dry_protocol && model.empty()) {
++        std::fprintf(stderr, "--model required unless --dry-protocol\n");
++        return 2;
++    }
++    if (rank == 0 && listen.empty()) {
++        std::fprintf(stderr, "rank 0 requires --listen HOST:PORT\n");
++        return 2;
++    }
++    if (rank != 0 && coord.empty()) {
++        std::fprintf(stderr, "workers require --coord HOST:PORT\n");
++        return 2;
++    }
++
++    RankSpec spec;
++    spec.session_id = session_id ? session_id : 1;
++    spec.world_size = world;
++    spec.rank = rank;
++    spec.local_device = device;
++    spec.n_experts = 896;
++    spec.moe_ffn = 1536;
++    spec.expert_block_elems = 256;
++    spec.vocab = 163840;
++    fill_digests(&spec);
++
++    TransportConfig tcfg;
++    tcfg.connect_timeout = std::chrono::milliseconds(120000);
++    tcfg.recv_timeout = std::chrono::milliseconds(600000);
++    tcfg.phase_timeout = std::chrono::milliseconds(600000);
++
++    std::string err;
++
++    if (dry_protocol) {
++        if (rank != 0) {
++            std::fprintf(stderr, "--dry-protocol is rank0-only (localhost multi-thread)\n");
++            return 2;
++        }
++        LocalhostDryRunConfig dcfg;
++        dcfg.world_size = world;
++        dcfg.tokens = {1, 2, 3, 4};
++        dcfg.session_id = spec.session_id;
++        dcfg.vocab = spec.vocab;
++        dcfg.model_digest = spec.model_digest;
++        dcfg.plan_digest = spec.plan_digest;
++        auto result = run_localhost_protocol_dry_run(dcfg);
++        if (!result.ok) {
++            std::fprintf(stderr, "dry-protocol failed: %s\n", result.error.c_str());
++            return 1;
++        }
++        std::printf("dry-protocol OK world=%d steps=%zu\n", world, dcfg.tokens.size());
++        return 0;
++    }
++
++    KimiK3DistRank dist;
++    KimiK3DistRankLoadOptions lopt;
++    lopt.max_ctx = max_ctx;
++    lopt.verbose = true;
++    std::unique_ptr<RankCollective> coll;
++
++    auto do_load = [&](std::string* e) -> bool {
++        return kimi_k3_dist_rank_load(model, spec, lopt, &dist, e);
++    };
++
++    if (rank == 0) {
++        std::string host;
++        uint16_t port = 0;
++        if (!parse_host_port(listen, &host, &port)) {
++            std::fprintf(stderr, "bad --listen %s\n", listen.c_str());
++            return 2;
++        }
++        tcfg.host = host;
++        tcfg.port = port;
++
++        CoordinatorTransport ctr(spec, tcfg);
++        if (!ctr.host(&err)) {
++            std::fprintf(stderr, "listen failed: %s\n", err.c_str());
++            return 1;
++        }
++        std::printf("[rank0] listening %s:%u — waiting for %d workers\n", host.c_str(),
++                    (unsigned)ctr.port(), world - 1);
++
++        // NCCL: rank0 must call InitRank concurrently with workers. Start it inside
++        // the id provider on a background thread BEFORE the id is dispatched.
++        NcclUniqueId nccl_id{};
++        std::thread nccl_thr;
++        std::string nccl_err;
++        std::atomic<bool> nccl_ok{false};
++
++        if (!ctr.bootstrap(
++                [&](NcclUniqueId* id, std::string* e) {
++                    if (!make_nccl_unique_id_bytes(id, e)) return false;
++                    nccl_id = *id;
++                    nccl_thr = std::thread([&] {
++                        auto c = make_nccl_rank_collective(world, 0, device, nccl_id, &nccl_err);
++                        if (c) {
++                            coll = std::move(c);
++                            nccl_ok = true;
++                        }
++                    });
++                    return true;
++                },
++                &err)) {
++            if (nccl_thr.joinable()) nccl_thr.join();
++            std::fprintf(stderr, "coord bootstrap failed: %s\n", err.c_str());
++            return 1;
++        }
++        if (nccl_thr.joinable()) nccl_thr.join();
++        if (!nccl_ok || !coll) {
++            std::fprintf(stderr, "rank0 NCCL init failed: %s\n", nccl_err.c_str());
++            return 1;
++        }
++
++        if (!do_load(&err)) {
++            std::fprintf(stderr, "rank0 load failed: %s\n", err.c_str());
++            ctr.fail(err, nullptr);
++            return 1;
++        }
++
++        std::vector<int> prompt;
++        if (!prompt_file.empty()) prompt = load_ids_file(prompt_file);
++        else if (!prompt_csv.empty()) prompt = parse_ids_csv(prompt_csv);
++        else prompt = {1};
++        if (prompt.empty()) {
++            std::fprintf(stderr, "empty prompt ids\n");
++            return 2;
++        }
++
++        std::vector<float> logits((size_t)dist.cfg.vocab);
++
++        auto one_step = [&](int tok, float* logits_out) -> bool {
++            if (!ctr.begin_step(tok, &err)) {
++                std::fprintf(stderr, "begin_step: %s\n", err.c_str());
++                return false;
++            }
++            if (!kimi_k3_dist_forward_token(dist, *coll, tok, logits_out, &err)) {
++                std::fprintf(stderr, "forward: %s\n", err.c_str());
++                ctr.complete_local_step(false, 1, err, nullptr);
++                ctr.fail(err, nullptr);
++                return false;
++            }
++            if (!ctr.complete_local_step(true, 0, "", &err)) {
++                std::fprintf(stderr, "complete_local_step: %s\n", err.c_str());
++                return false;
++            }
++            if (!ctr.pump(std::chrono::milliseconds(600000), &err)) {
++                std::fprintf(stderr, "pump: %s\n", err.c_str());
++                return false;
++            }
++            return true;
++        };
++
++        for (size_t i = 0; i < prompt.size(); ++i) {
++            float* lp = (i + 1 == prompt.size()) ? logits.data() : nullptr;
++            if (!one_step(prompt[i], lp)) return 1;
++        }
++        std::printf("prefill done (%zu toks). generating %d...\n", prompt.size(), n_predict);
++
++        std::vector<int> generated;
++        for (int n = 0; n < n_predict; ++n) {
++            const int next = kimi_k3_dist_argmax(logits.data(), dist.cfg.vocab);
++            generated.push_back(next);
++            std::printf(" gen[%d]=%d\n", n, next);
++            if (!one_step(next, logits.data())) return 1;
++        }
++
++        if (!ctr.finish(&err)) {
++            std::fprintf(stderr, "finish: %s\n", err.c_str());
++            return 1;
++        }
++        // Best-effort local finish ack (finish() waits on workers + rx thread).
++        ctr.complete_local_finish_ack(nullptr);
++        std::printf("OK generated %zu tokens\n", generated.size());
++        kimi_k3_dist_rank_free(&dist);
++        return 0;
++    }
++
++    // ---- workers ----
++    std::string host;
++    uint16_t port = 0;
++    if (!parse_host_port(coord, &host, &port)) {
++        std::fprintf(stderr, "bad --coord\n");
++        return 2;
++    }
++    tcfg.host = host;
++    tcfg.port = port;
++    RankTransport wtr(spec, tcfg);
++    if (!wtr.bootstrap(
++            [&](const NcclUniqueId& id, std::string* e) {
++                auto c = make_nccl_rank_collective(world, rank, device, id, e);
++                if (!c) return false;
++                coll = std::move(c);
++                return true;
++            },
++            [&](std::string* e) { return do_load(e); }, &err)) {
++        std::fprintf(stderr, "worker bootstrap: %s\n", err.c_str());
++        return 1;
++    }
++
++    for (;;) {
++        int tok = -1;
++        if (!wtr.wait_token(&tok, &err)) {
++            if (wtr.state() == RankState::Finished || wtr.state() == RankState::FinishPending) {
++                wtr.wait_finished(nullptr);
++                std::printf("[rank %d] finished\n", rank);
++                kimi_k3_dist_rank_free(&dist);
++                return 0;
++            }
++            std::fprintf(stderr, "wait_token: %s state=%d\n", err.c_str(), (int)wtr.state());
++            return 1;
++        }
++        if (!kimi_k3_dist_forward_token(dist, *coll, tok, nullptr, &err)) {
++            wtr.report_step_done(false, 1, err, nullptr);
++            std::fprintf(stderr, "forward: %s\n", err.c_str());
++            return 1;
++        }
++        if (!wtr.report_step_done(true, 0, "", &err)) {
++            std::fprintf(stderr, "step_done: %s\n", err.c_str());
++            return 1;
++        }
++    }
++}
+diff --git a/runtime/include/sparkinfer/models/kimi_k3_dist_forward.h b/runtime/include/sparkinfer/models/kimi_k3_dist_forward.h
+new file mode 100755
+index 0000000..0f9be00
+--- /dev/null
++++ b/runtime/include/sparkinfer/models/kimi_k3_dist_forward.h
+@@ -0,0 +1,44 @@
++#pragma once
++// Distributed (one process per Spark) eager decode step for Kimi-K3 TP3/TP4.
++//
++// Mirrors the collective placement of kimi_k3_tp_forward_token for a SINGLE local
++// rank, using RankCollective (NCCL InitRank) instead of single-process
++// ncclCommInitAll. Graphs are OFF. WEPS/graphs stay disabled for correctness.
++
++#include "sparkinfer/models/kimi_k3_dist_rank.h"
++#include "sparkinfer/tp/rank_collective.h"
++
++#include <memory>
++#include <string>
++
++namespace sparkinfer {
++
++// After load: create NCCL RankCollective from the coordinator's unique id.
++// Stores the collective on *out (owned). local_device must match the load device.
++bool kimi_k3_dist_rank_init_nccl(KimiK3DistRank* rank,
++                                 const tp::dist::NcclUniqueId& id,
++                                 std::unique_ptr<tp::dist::RankCollective>* out,
++                                 std::string* error = nullptr);
++
++// One eager decode token on this rank. out_logits is host [vocab]; only used when
++// this rank owns the full LM head (rank 0). Workers may pass nullptr.
++// Requires: loaded DistRank, matching RankCollective world/rank, WEPS off.
++bool kimi_k3_dist_forward_token(KimiK3DistRank& rank,
++                                tp::dist::RankCollective& coll,
++                                int token_id,
++                                float* out_logits_host,
++                                std::string* error = nullptr);
++
++// Prefill: run each prompt id through dist_forward_token; keep only final logits
++// on rank 0 (same contract as kimi_k3_generate pipeline prefill).
++bool kimi_k3_dist_forward_prompt(KimiK3DistRank& rank,
++                                 tp::dist::RankCollective& coll,
++                                 const int* ids,
++                                 int n_ids,
++                                 float* out_logits_host,
++                                 std::string* error = nullptr);
++
++// Argmax sample (greedy). n_vocab = cfg.vocab.
++int kimi_k3_dist_argmax(const float* logits, int n_vocab);
++
++}  // namespace sparkinfer
+diff --git a/runtime/include/sparkinfer/models/kimi_k3_dist_rank.h b/runtime/include/sparkinfer/models/kimi_k3_dist_rank.h
+index 6f3a62c..7c43f17 100755
+--- a/runtime/include/sparkinfer/models/kimi_k3_dist_rank.h
++++ b/runtime/include/sparkinfer/models/kimi_k3_dist_rank.h
+@@ -21,6 +21,7 @@ struct KimiK3DistRank {
+     KimiK3Forward fwd;
+     float* x = nullptr;
+     float* x_next = nullptr;
++    float* logits = nullptr;  // [vocab], rank 0 only
+     cudaStream_t stream = nullptr;
+     int device = 0;
+     bool loaded = false;
+diff --git a/runtime/include/sparkinfer/tp/rank_transport.h b/runtime/include/sparkinfer/tp/rank_transport.h
+index 7292215..6369368 100644
+--- a/runtime/include/sparkinfer/tp/rank_transport.h
++++ b/runtime/include/sparkinfer/tp/rank_transport.h
+@@ -132,6 +132,13 @@ public:
+     bool finish(std::string* error = nullptr);
+     bool fail(const std::string& detail, std::string* error = nullptr);
+ 
++    // Rank 0 runs compute in-process (no TCP self-socket). After each local
++    // forward/finish, inject the missing rank-0 ack so all_seen(step_done_) can
++    // complete. Workers still report over TCP via the rx thread.
++    bool complete_local_step(bool success, int status, const std::string& detail,
++                             std::string* error = nullptr);
++    bool complete_local_finish_ack(std::string* error = nullptr);
++
+     // Drain worker messages until state changes or timeout.
+     bool pump(std::chrono::milliseconds budget, std::string* error = nullptr);
+ 
+diff --git a/runtime/src/models/kimi_k3_dist_forward.cpp b/runtime/src/models/kimi_k3_dist_forward.cpp
+new file mode 100755
+index 0000000..0c78ea9
+--- /dev/null
++++ b/runtime/src/models/kimi_k3_dist_forward.cpp
+@@ -0,0 +1,248 @@
++#include "sparkinfer/models/kimi_k3_dist_forward.h"
++
++#include "sparkinfer/kernels/kimi_k3.h"
++
++#include <cstdio>
++#include <cstring>
++#include <vector>
++
++namespace k3k = sparkinfer::kernels::k3;
++
++namespace sparkinfer {
++namespace {
++
++void set_err(std::string* error, const std::string& v) {
++    if (error) *error = v;
++}
++
++bool embed_token(const KimiK3Weights& w, const KimiK3Config& cfg, int token_id,
++                 float* x, cudaStream_t stream) {
++    if (!w.token_embd.ok()) return false;
++    long row_bytes = 0;
++    if (w.token_embd.type == 0)
++        row_bytes = (long)cfg.hidden * sizeof(float);
++    else if (w.token_embd.type == 8)
++        row_bytes = (long)(cfg.hidden / 32) * 34;
++    else
++        return false;
++    const char* base = (const char*)w.token_embd.data + (size_t)token_id * (size_t)row_bytes;
++    return k3k::dequant_f32_by_type(x, base, cfg.hidden, w.token_embd.type, stream);
++}
++
++bool ensure_logits(KimiK3DistRank& rank) {
++    if (rank.logits) return true;
++    if (rank.plan.spec.rank != 0) return true;  // workers skip head
++    if (cudaMalloc(&rank.logits, (size_t)rank.cfg.vocab * sizeof(float)) != cudaSuccess)
++        return false;
++    return true;
++}
++
++bool allreduce_partial(KimiK3Forward& fwd, int layer, K3LayerPhase phase,
++                       tp::dist::RankCollective& coll, cudaStream_t stream,
++                       std::string* error) {
++    int n = 0;
++    float* buf = kimi_k3_partial_buffer(fwd, layer, phase, &n);
++    if (!buf || n <= 0) {
++        set_err(error, "partial buffer missing for allreduce");
++        return false;
++    }
++    if (!coll.allreduce_f32(buf, (std::size_t)n,
++                            (tp::dist::RankStreamHandle)(std::uintptr_t)stream)) {
++        set_err(error, "RankCollective::allreduce_f32 failed");
++        return false;
++    }
++    return true;
++}
++
++}  // namespace
++
++bool kimi_k3_dist_rank_init_nccl(KimiK3DistRank* rank,
++                                 const tp::dist::NcclUniqueId& id,
++                                 std::unique_ptr<tp::dist::RankCollective>* out,
++                                 std::string* error) {
++    if (!rank || !out || !rank->loaded) {
++        set_err(error, "dist_rank_init_nccl: bad args / not loaded");
++        return false;
++    }
++    auto coll = tp::dist::make_nccl_rank_collective(
++        rank->plan.spec.world_size, rank->plan.spec.rank, rank->device, id, error);
++    if (!coll) return false;
++    *out = std::move(coll);
++    return true;
++}
++
++bool kimi_k3_dist_forward_token(KimiK3DistRank& rank,
++                                tp::dist::RankCollective& coll,
++                                int token_id,
++                                float* out_logits_host,
++                                std::string* error) {
++    if (!rank.loaded || !rank.x || !rank.x_next || !rank.stream) {
++        set_err(error, "dist_forward_token: rank not loaded");
++        return false;
++    }
++    if (coll.world_size() != rank.plan.spec.world_size ||
++        coll.rank() != rank.plan.spec.rank) {
++        set_err(error, "dist_forward_token: collective rank/world mismatch");
++        return false;
++    }
++    if (cudaSetDevice(rank.device) != cudaSuccess) {
++        set_err(error, "cudaSetDevice failed");
++        return false;
++    }
++
++    const KimiK3Config& cfg = rank.cfg;
++    const int H = cfg.hidden;
++    const int tp_size = rank.plan.spec.world_size;
++    const int my_rank = rank.plan.spec.rank;
++    KimiK3Weights& w = rank.weights;
++    KimiK3Forward& fwd = rank.fwd;
++
++    rank.state.n_ckpt = 0;
++
++    if (!embed_token(w, cfg, token_id, rank.x, rank.stream)) {
++        set_err(error, "embed_token failed");
++        return false;
++    }
++
++    long n_coll = 0;
++    for (int layer = 0; layer < cfg.n_layers; ++layer) {
++        const bool is_moe = layer >= cfg.leading_dense;
++        const bool kda_reduce =
++            tp_size > 1 && cfg.is_kda_layer(layer) && KimiK3Weights::shards_kda(w.policy);
++        const bool mla_reduce =
++            tp_size > 1 && !cfg.is_kda_layer(layer) && KimiK3Weights::shards_mla(w.policy);
++        const bool attn_reduce = kda_reduce || mla_reduce;
++
++        if (!kimi_k3_forward_layer_phase(fwd, layer, K3LayerPhase::Attn, rank.x, rank.x_next)) {
++            set_err(error, "Attn phase failed at layer " + std::to_string(layer));
++            return false;
++        }
++
++        if (attn_reduce) {
++            if (!allreduce_partial(fwd, layer, K3LayerPhase::Attn, coll, rank.stream, error)) {
++                if (error && error->empty())
++                    set_err(error, "attn allreduce failed layer " + std::to_string(layer));
++                return false;
++            }
++            ++n_coll;
++            if (!kimi_k3_forward_layer_phase(fwd, layer, K3LayerPhase::FfnPartial, rank.x,
++                                             rank.x_next)) {
++                set_err(error, "FfnPartial after attn-reduce failed layer " +
++                                   std::to_string(layer));
++                return false;
++            }
++        } else {
++            if (!kimi_k3_forward_layer_phase(fwd, layer, K3LayerPhase::FfnPartial, rank.x,
++                                             rank.x_next)) {
++                set_err(error, "FfnPartial failed layer " + std::to_string(layer));
++                return false;
++            }
++        }
++
++        // MoE width/expert partial must be summed before FfnFinish (rms_norm not linear).
++        if (is_moe && tp_size > 1) {
++            if (!allreduce_partial(fwd, layer, K3LayerPhase::FfnPartial, coll, rank.stream,
++                                   error)) {
++                if (error && error->empty())
++                    set_err(error, "moe allreduce failed layer " + std::to_string(layer));
++                return false;
++            }
++            ++n_coll;
++        }
++
++        if (!kimi_k3_forward_layer_phase(fwd, layer, K3LayerPhase::FfnFinish, rank.x,
++                                         rank.x_next)) {
++            set_err(error, "FfnFinish failed layer " + std::to_string(layer));
++            return false;
++        }
++        std::swap(rank.x, rank.x_next);
++    }
++
++    // Head: only rank 0 holds output.weight under dist load policy.
++    if (my_rank == 0) {
++        if (!ensure_logits(rank)) {
++            set_err(error, "logits cudaMalloc failed");
++            return false;
++        }
++        if (cfg.attn_res_block_size > 0) {
++            if (!w.has_output_res_score || !w.output_res_score.ok()) {
++                set_err(error, "missing output_res_score");
++                return false;
++            }
++            k3k::attn_res_mix_f32(rank.x_next, rank.state.res_bank, rank.x,
++                                  (const float*)w.output_res_score.data, H, rank.state.n_ckpt,
++                                  cfg.rms_eps, rank.stream);
++            std::swap(rank.x, rank.x_next);
++        }
++        if (!w.output_norm.ok() || !w.output.ok()) {
++            set_err(error, "missing output_norm/output");
++            return false;
++        }
++        k3k::rms_norm_f32(rank.x_next, rank.x, (const float*)w.output_norm.data, H,
++                          cfg.rms_eps, rank.stream);
++        if (!k3k::k3_proj_f32(rank.logits, rank.x_next, w.output.data, w.output.type,
++                              cfg.vocab, H, rank.stream)) {
++            set_err(error, "lm head proj failed");
++            return false;
++        }
++        if (out_logits_host) {
++            if (cudaStreamSynchronize(rank.stream) != cudaSuccess) {
++                set_err(error, "stream sync before logits D2H failed");
++                return false;
++            }
++            if (cudaMemcpy(out_logits_host, rank.logits,
++                           (size_t)cfg.vocab * sizeof(float),
++                           cudaMemcpyDeviceToHost) != cudaSuccess) {
++                set_err(error, "logits D2H failed");
++                return false;
++            }
++        }
++    } else {
++        // Workers still need stream-ordered progress and matching KDA/KV state.
++        if (cudaStreamSynchronize(rank.stream) != cudaSuccess) {
++            set_err(error, "worker stream sync failed");
++            return false;
++        }
++    }
++
++    // Advance device position (KV / KDA index) and host mirror together.
++    if (!kimi_k3_set_position(rank.state, rank.state.position + 1)) {
++        set_err(error, "kimi_k3_set_position failed");
++        return false;
++    }
++
++    (void)n_coll;
++    return true;
++}
++
++bool kimi_k3_dist_forward_prompt(KimiK3DistRank& rank,
++                                 tp::dist::RankCollective& coll,
++                                 const int* ids,
++                                 int n_ids,
++                                 float* out_logits_host,
++                                 std::string* error) {
++    if (!ids || n_ids <= 0) {
++        set_err(error, "empty prompt");
++        return false;
++    }
++    for (int i = 0; i < n_ids; ++i) {
++        float* logits = (i + 1 == n_ids) ? out_logits_host : nullptr;
++        if (!kimi_k3_dist_forward_token(rank, coll, ids[i], logits, error)) return false;
++    }
++    return true;
++}
++
++int kimi_k3_dist_argmax(const float* logits, int n_vocab) {
++    if (!logits || n_vocab <= 0) return 0;
++    int best = 0;
++    float v = logits[0];
++    for (int i = 1; i < n_vocab; ++i) {
++        if (logits[i] > v) {
++            v = logits[i];
++            best = i;
++        }
++    }
++    return best;
++}
++
++}  // namespace sparkinfer
+diff --git a/runtime/src/models/kimi_k3_dist_rank.cpp b/runtime/src/models/kimi_k3_dist_rank.cpp
+index 93553cd..0373e47 100755
+--- a/runtime/src/models/kimi_k3_dist_rank.cpp
++++ b/runtime/src/models/kimi_k3_dist_rank.cpp
+@@ -171,6 +171,7 @@ void kimi_k3_dist_rank_free(KimiK3DistRank* r) {
+         cudaSetDevice(r->device);
+         if (r->x) cudaFree(r->x);
+         if (r->x_next) cudaFree(r->x_next);
++        if (r->logits) cudaFree(r->logits);
+         if (r->fwd.s) kimi_k3_forward_free_scratch(r->fwd);
+         kimi_k3_free_state(r->state);
+         kimi_k3_free_weights(r->weights);
+diff --git a/runtime/src/tp/rank_transport_tcp.cpp b/runtime/src/tp/rank_transport_tcp.cpp
+index 2aa97bf..5e18daf 100644
+--- a/runtime/src/tp/rank_transport_tcp.cpp
++++ b/runtime/src/tp/rank_transport_tcp.cpp
+@@ -709,6 +709,67 @@ bool CoordinatorTransport::fail(const std::string& detail, std::string* error) {
+     return dispatch_outbound(outbound, error);
+ }
+ 
++bool CoordinatorTransport::complete_local_step(bool success, int status,
++                                               const std::string& detail,
++                                               std::string* error) {
++    std::lock_guard<std::mutex> lock(mu_);
++    if (coord_.state() != CoordinatorState::StepInFlight) {
++        set_err(error, "complete_local_step: no step in flight");
++        return false;
++    }
++    Message m;
++    m.type = success ? MessageType::StepDone : MessageType::Failure;
++    m.session_id = cluster_.session_id;
++    m.sequence = coord_.next_sequence();
++    m.rank = 0;
++    m.world_size = cluster_.world_size;
++    m.local_device = cluster_.local_device;
++    m.n_experts = cluster_.n_experts;
++    m.moe_ffn = cluster_.moe_ffn;
++    m.expert_block_elems = cluster_.expert_block_elems;
++    m.vocab = cluster_.vocab;
++    m.model_digest = cluster_.model_digest;
++    m.plan_digest = cluster_.plan_digest;
++    m.phase = Phase::Step;
++    m.status = status;
++    m.detail = detail;
++    std::vector<Message> outbound;
++    AuthenticatedPeer ap{0, conn_ids_.empty() ? 1ULL : conn_ids_[0]};
++    if (!coord_.accept(ap, m, &outbound, error)) return false;
++    return dispatch_outbound(outbound, error);
++}
++
++bool CoordinatorTransport::complete_local_finish_ack(std::string* error) {
++    std::lock_guard<std::mutex> lock(mu_);
++    if (coord_.state() != CoordinatorState::WaitingFinishAck &&
++        coord_.state() != CoordinatorState::Finished) {
++        // finish() may still be collecting; allow inject when waiting
++        if (coord_.state() != CoordinatorState::WaitingFinishAck) {
++            set_err(error, "complete_local_finish_ack: not waiting for finish acks");
++            return false;
++        }
++    }
++    Message m;
++    m.type = MessageType::FinishAck;
++    m.session_id = cluster_.session_id;
++    m.sequence = coord_.next_sequence();
++    m.rank = 0;
++    m.world_size = cluster_.world_size;
++    m.local_device = cluster_.local_device;
++    m.n_experts = cluster_.n_experts;
++    m.moe_ffn = cluster_.moe_ffn;
++    m.expert_block_elems = cluster_.expert_block_elems;
++    m.vocab = cluster_.vocab;
++    m.model_digest = cluster_.model_digest;
++    m.plan_digest = cluster_.plan_digest;
++    m.phase = Phase::Shutdown;
++    m.status = 0;
++    std::vector<Message> outbound;
++    AuthenticatedPeer ap{0, conn_ids_.empty() ? 1ULL : conn_ids_[0]};
++    if (!coord_.accept(ap, m, &outbound, error)) return false;
++    return dispatch_outbound(outbound, error);
++}
++
+ bool CoordinatorTransport::pump(std::chrono::milliseconds budget, std::string* error) {
+     const auto deadline = std::chrono::steady_clock::now() + budget;
+     while (std::chrono::steady_clock::now() < deadline) {
+diff --git a/runtime/tests/CMakeLists.txt b/runtime/tests/CMakeLists.txt
+index 5534855..a5bf3a3 100644
+--- a/runtime/tests/CMakeLists.txt
++++ b/runtime/tests/CMakeLists.txt
+@@ -153,3 +153,14 @@ set_target_properties(tp_rank_local_loader_cpu_test PROPERTIES CXX_STANDARD 17)
+ target_include_directories(tp_rank_local_loader_cpu_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+ add_test(NAME tp_rank_local_loader_cpu_test COMMAND tp_rank_local_loader_cpu_test)
+ 
++# Phase 3: distributed generate control-plane dry run (TCP/protocol; no CUDA).
++add_executable(tp_dist_generate_protocol_cpu_test tp_dist_generate_protocol_cpu_test.cpp
++               ../src/tp/rank_protocol.cpp
++               ../src/tp/rank_transport_tcp.cpp
++               ../src/tp/rank_collective.cpp
++               ../src/tp/weight_plan.cpp
++               ../src/tp/shard.cpp)
++set_target_properties(tp_dist_generate_protocol_cpu_test PROPERTIES CXX_STANDARD 17)
++target_link_libraries(tp_dist_generate_protocol_cpu_test PRIVATE Threads::Threads)
++add_test(NAME tp_dist_generate_protocol_cpu_test COMMAND tp_dist_generate_protocol_cpu_test)
++
+diff --git a/runtime/tests/tp_dist_generate_protocol_cpu_test.cpp b/runtime/tests/tp_dist_generate_protocol_cpu_test.cpp
+new file mode 100755
+index 0000000..c4a1fca
+--- /dev/null
++++ b/runtime/tests/tp_dist_generate_protocol_cpu_test.cpp
+@@ -0,0 +1,65 @@
++// CPU test: Phase 3 control-plane hooks for distributed generate.
++// - localhost protocol dry run (existing)
++// - CoordinatorTransport complete_local_step sequencing (unit-level via dry run parity)
++// No CUDA / no GGUF.
++
++#include "sparkinfer/tp/rank_protocol.h"
++#include "sparkinfer/tp/rank_transport.h"
++
++#include <cstdio>
++#include <string>
++
++using namespace sparkinfer::tp::dist;
++
++static int g_fail = 0;
++static int g_pass = 0;
++
++static void check(bool c, const std::string& w) {
++    if (c) {
++        ++g_pass;
++        return;
++    }
++    ++g_fail;
++    std::printf("FAIL: %s\n", w.c_str());
++}
++
++int main() {
++    {
++        LocalhostDryRunConfig cfg;
++        cfg.world_size = 3;
++        cfg.tokens = {10, 20, 30};
++        cfg.session_id = 42;
++        cfg.vocab = 163840;
++        cfg.model_digest[0] = 1;
++        cfg.plan_digest[0] = 2;
++        auto r = run_localhost_protocol_dry_run(cfg);
++        check(r.ok, "localhost dry run tp3: " + r.error);
++        if (r.ok) {
++            check(r.tokens_seen_per_rank.size() == 3, "3 ranks saw tokens");
++            check(r.tokens_seen_per_rank[0].size() == 3, "rank0 3 tokens");
++            check(r.final_coord_state == CoordinatorState::Finished, "finished");
++        }
++    }
++    {
++        LocalhostDryRunConfig cfg;
++        cfg.world_size = 4;
++        cfg.tokens = {1, 2};
++        cfg.session_id = 7;
++        cfg.vocab = 163840;
++        cfg.model_digest[0] = 3;
++        cfg.plan_digest[0] = 4;
++        auto r = run_localhost_protocol_dry_run(cfg);
++        check(r.ok, "localhost dry run tp4: " + r.error);
++    }
++
++    // plan_identity_string stable
++    {
++        auto a = plan_identity_string(3);
++        auto b = plan_identity_string(3);
++        check(a == b && a.find("world=3") != std::string::npos, "plan identity");
++    }
++
++    std::printf("tp_dist_generate_protocol_cpu_test: %d checks, %d failures\n", g_pass + g_fail,
++                g_fail);
++    return g_fail ? 1 : 0;
++}
+-- 
+2.43.0
+

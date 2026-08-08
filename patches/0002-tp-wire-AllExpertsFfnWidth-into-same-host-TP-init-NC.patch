@@ -1,0 +1,153 @@
+From b421fb0d7925cfa7f822f05c2db1dcdf27c70c22 Mon Sep 17 00:00:00 2001
+From: Hermes <hermes@local>
+Date: Fri, 7 Aug 2026 10:33:31 -0700
+Subject: [PATCH 02/12] tp: wire AllExpertsFfnWidth into same-host TP init +
+ NCCL prefill fallback
+
+---
+ runtime/src/models/kimi_k3.cpp    | 11 ++++-
+ runtime/src/models/kimi_k3_tp.cpp | 74 ++++++++++++++++++++++++++++---
+ 2 files changed, 76 insertions(+), 9 deletions(-)
+
+diff --git a/runtime/src/models/kimi_k3.cpp b/runtime/src/models/kimi_k3.cpp
+index 69d813f..93f695f 100644
+--- a/runtime/src/models/kimi_k3.cpp
++++ b/runtime/src/models/kimi_k3.cpp
+@@ -1020,8 +1020,15 @@ static int k3_ffn_batch_cap_env() {
+ // sized 3072 with weights packed 768 wide runs at full speed and reads three
+ // experts' worth of neighbouring memory as if it were this expert's.
+ int k3_moe_ffn_local(const KimiK3Forward& fwd, const KimiK3Config& cfg) {
+-    if (fwd.w && fwd.w->shard.moe_2d && fwd.w->shard.moe_ffn > 0)
+-        return fwd.w->shard.moe_ffn;
++    if (!fwd.w) return cfg.moe_ffn;
++    const auto& sh = fwd.w->shard;
++    // 2-D MoE and all-expert width TP both pack a narrower FFN band per rank.
++    // AllExpertsFfnWidth intentionally leaves moe_2d=false (experts are not
++    // identity-sharded), so the old moe_2d-only check would keep cfg.moe_ffn
++    // against 512-wide weights and silently corrupt the MoE path.
++    if (sh.moe_ffn > 0 &&
++        (sh.moe_2d || sh.moe_shard_mode == tp::MoeShardMode::AllExpertsFfnWidth))
++        return sh.moe_ffn;
+     return cfg.moe_ffn;
+ }
+ 
+diff --git a/runtime/src/models/kimi_k3_tp.cpp b/runtime/src/models/kimi_k3_tp.cpp
+index 7959523..b09a8e1 100644
+--- a/runtime/src/models/kimi_k3_tp.cpp
++++ b/runtime/src/models/kimi_k3_tp.cpp
+@@ -252,12 +252,30 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
+                     const std::vector<int>& devices, int max_ctx, KimiK3TP& out) {
+     const int tp_size = (int)devices.size();
+     if (tp_size < 1) return false;
+-    if (tp_size > 1 && (cfg.n_experts % tp_size) != 0) {
+-        std::fprintf(stderr, "[k3-tp] %d experts do not divide %d ranks — a ragged "
+-                             "expert band would give every rank a different launch "
+-                             "geometry\n", cfg.n_experts, tp_size);
++    // Whole-expert TP requires n_experts % tp_size == 0. When that fails but the
++    // pruned FFN width divides cleanly on a quant block, use explicit all-expert
++    // FFN-width TP (every rank keeps all expert identities; each owns one FFN
++    // band). Do NOT fall through to a ragged expert split.
++    const bool experts_divisible = (cfg.n_experts % tp_size) == 0;
++    const bool width_divisible =
++        tp_size > 1 && cfg.moe_ffn > 0 && (cfg.moe_ffn % tp_size) == 0 &&
++        ((cfg.moe_ffn / tp_size) % 256) == 0;
++    const bool use_all_expert_width =
++        tp_size > 1 && !experts_divisible && width_divisible;
++    if (tp_size > 1 && !experts_divisible && !width_divisible) {
++        std::fprintf(stderr,
++                     "[k3-tp] %d experts do not divide %d ranks and moe_ffn=%d is "
++                     "not a block-aligned width split - refusing ragged expert "
++                     "geometry\n",
++                     cfg.n_experts, tp_size, cfg.moe_ffn);
+         return false;
+     }
++    if (use_all_expert_width) {
++        std::fprintf(stderr,
++                     "[k3-tp] enabling AllExpertsFfnWidth TP%d: n_experts=%d "
++                     "(all ranks), moe_ffn=%d -> %d/rank\n",
++                     tp_size, cfg.n_experts, cfg.moe_ffn, cfg.moe_ffn / tp_size);
++    }
+ 
+     out.cfg = cfg;
+     out.opt = opt;
+@@ -353,6 +371,26 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
+             : tp::Band{0, cfg.n_experts};
+         R.weights.shard.moe_ffn_total = cfg.moe_ffn;
+ 
++        if (use_all_expert_width) {
++            const tp::ShardError se = tp::moe_all_expert_width_dims(
++                cfg.n_experts, cfg.moe_ffn, tp_size, r, /*block_elems=*/256,
++                &R.weights.shard);
++            if (!se.ok()) {
++                rank_err[(size_t)r] = "AllExpertsFfnWidth: " + se.message;
++                return false;
++            }
++            if (R.weights.shard.n_experts != cfg.n_experts ||
++                R.weights.shard.expert_band.offset != 0 ||
++                R.weights.shard.expert_band.extent != cfg.n_experts ||
++                R.weights.shard.moe_ffn <= 0 ||
++                R.weights.shard.moe_shard_mode !=
++                    tp::MoeShardMode::AllExpertsFfnWidth) {
++                rank_err[(size_t)r] =
++                    "AllExpertsFfnWidth produced inconsistent ShardDims";
++                return false;
++            }
++            // Geometry is final for this mode; skip default 2-D MoE setup.
++        } else {
+         // 2-D MoE: SPARKINFER_K3_MOE_2D = number of EXPERT GROUPS. Read once per rank
+         // here so the weights, the state and the kernels all derive their geometry
+         // from this single ShardDims — see moe_2d_dims.
+@@ -392,6 +430,7 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
+                 moe_2d_note[(size_t)r] = se.message;
+             }
+         }
++        }  // !use_all_expert_width
+ 
+         if (!kimi_k3_load_weights(g, cfg, opt, R.weights, 0, cfg.n_layers - 1)) {
+             rank_err[(size_t)r] = "weight load failed";
+@@ -444,7 +483,14 @@ bool kimi_k3_tp_init(const GGUF& g, const KimiK3Config& cfg, const K3PlanOptions
+         // Buffered, not printed: eight ranks writing stderr concurrently interleaves
+         // mid-line. Emitted in rank order after the join so the log reads as before.
+         char line[220];
+-        if (R.weights.shard.moe_2d) {
++        if (R.weights.shard.moe_shard_mode == tp::MoeShardMode::AllExpertsFfnWidth) {
++            std::snprintf(line, sizeof(line),
++                          "[k3-tp] rank %d: device %d, all %d experts, ffn [%d,%d) "
++                          "(AllExpertsFfnWidth)\n",
++                          r, R.device, R.weights.shard.n_experts,
++                          R.weights.shard.moe_ffn_band.offset,
++                          R.weights.shard.moe_ffn_band.end());
++        } else if (R.weights.shard.moe_2d) {
+             std::snprintf(line, sizeof(line),
+                           "[k3-tp] rank %d: device %d, experts [%d,%d), ffn [%d,%d) "
+                           "(2-D MoE %dx%d)\n",
+@@ -2214,10 +2260,24 @@ bool kimi_k3_tp_prefill(KimiK3TP& p, const int* ids, int n_ids, float* out_logit
+     // Tail tokens do too: a tile of 2 is barred by the rotation check
+     // (k3_prefill_pick_tile), and ≤3 tokens out of a 32k prompt is not worth a second
+     // ragged code path that would need its own proof.
+-    if (want_tile && n_ids > 1 && p.ranks.size() > 1 && p.prefill == nullptr)
++    // Tile prefill reduces via owned-buffer collectives (Mode B). Plain NCCL
++    // does not own those buffers; arming the tile path then fails at token 0
++    // after a full weight load. Auto-fall back to per-token prefill.
++    const bool coll_ok_for_tile = p.coll && p.coll->owns_buffers();
++    if (want_tile && !coll_ok_for_tile) {
++        static bool once = false;
++        if (!once) {
++            std::fprintf(stderr,
++                "[k3-prefill] tile path disabled: collective backend has no owned "
++                "buffers (typical for NCCL). Using per-token prefill.\n");
++            once = true;
++        }
++    }
++    if (want_tile && coll_ok_for_tile && n_ids > 1 && p.ranks.size() > 1 &&
++        p.prefill == nullptr)
+         k3_prefill_pool_init(p, want_T);
+ 
+-    const int T = (want_tile && p.prefill) ? p.prefill->tile : 0;
++    const int T = (want_tile && coll_ok_for_tile && p.prefill) ? p.prefill->tile : 0;
+     const int n_tiled = T > 0 ? ((n_ids - 1) / T) * T : 0;
+ 
+     struct MlaSplitPinScope {
+-- 
+2.43.0
+
