@@ -1,0 +1,408 @@
+From 62860bcef1235fb2176d9fcc211d1b3216d5f810 Mon Sep 17 00:00:00 2001
+From: Hermes <agent@local>
+Date: Sun, 9 Aug 2026 02:27:14 +0700
+Subject: [PATCH] feat: add temperature+top-k sampling, logit debug dump,
+ multi-prompt mode
+
+- --temperature T: 0=greedy (default), >0=scaled sampling
+- --top-k K: restrict sampling to top-K tokens (0=no filter)
+- Logit debug dump: top-5 logits with stats for first 5 decode steps
+- --prompts-file: load N prompts, reset KV cache between each
+- KV cache reset via sentinel token -2
+---
+ runtime/examples/kimi_k3_dist_generate.cpp | 281 +++++++++++++++------
+ 1 file changed, 208 insertions(+), 73 deletions(-)
+
+diff --git a/runtime/examples/kimi_k3_dist_generate.cpp b/runtime/examples/kimi_k3_dist_generate.cpp
+index b1b93c3..c68b443 100644
+--- a/runtime/examples/kimi_k3_dist_generate.cpp
++++ b/runtime/examples/kimi_k3_dist_generate.cpp
+@@ -1,4 +1,5 @@
+ // kimi_k3_dist_generate — multi-Spark (one process per rank) greedy decode.
++// Modified for multi-prompt HumanEval benchmark.
+ //
+ //   Rank 0: TCP coordinator + sample + begin_step + local forward
+ //   Ranks 1..W-1: workers (NCCL InitRank + load + wait_token loop)
+@@ -14,6 +15,7 @@
+ //       --model /path/k3-00001-of-00009.gguf
+ 
+ #include "sparkinfer/models/kimi_k3_dist_forward.h"
++#include "sparkinfer/models/kimi_k3.h"
+ #include "sparkinfer/models/kimi_k3_dist_rank.h"
+ #include "sparkinfer/tp/rank_protocol.h"
+ #include "sparkinfer/tp/rank_transport.h"
+@@ -28,6 +30,8 @@
+ #include <string>
+ #include <thread>
+ #include <vector>
++#include <random>
++#include <cmath>
+ 
+ using namespace sparkinfer;
+ using namespace sparkinfer::tp::dist;
+@@ -46,7 +50,7 @@ void usage(const char* argv0) {
+     std::fprintf(stderr,
+                  "usage: %s --rank R --world 3|4 (--listen HOST:PORT | --coord HOST:PORT)\n"
+                  "          --model FIRST.gguf [--prompt-ids 1,2,3] [--prompt-ids-file F]\n"
+-                 "          [--n-predict N] [--max-ctx N] [--device 0]\n"
++                 "          [--prompts-file F] [--n-predict N] [--max-ctx N] [--device 0]\n"
+                  "          [--session-id N] [--dry-protocol]\n",
+                  argv0);
+ }
+@@ -77,6 +81,18 @@ std::vector<int> load_ids_file(const std::string& path) {
+     return out;
+ }
+ 
++// Load multiple prompts from a file. Each line is comma-separated token IDs.
++std::vector<std::vector<int>> load_multi_prompts(const std::string& path) {
++    std::vector<std::vector<int>> all;
++    std::ifstream in(path);
++    std::string line;
++    while (std::getline(in, line)) {
++        if (line.empty() || line[0] == '#') continue;
++        all.push_back(parse_ids_csv(line));
++    }
++    return all;
++}
++
+ void fill_digests(RankSpec* spec) {
+     const std::string mid = "Kimi-K3-Neuron-IQ1S-GGUF";
+     const std::string pid = plan_identity_string(spec->world_size);
+@@ -92,9 +108,12 @@ void fill_digests(RankSpec* spec) {
+ 
+ int main(int argc, char** argv) {
+     int rank = -1, world = 3, device = 0, n_predict = 8, max_ctx = 8192;
++    float temperature = 0.0f;  // 0 = greedy, >0 = sampling
++    int top_k = 0;             // 0 = no top-k filtering
+     std::uint64_t session_id = 1;
+-    std::string model, listen, coord, prompt_csv, prompt_file;
++    std::string model, listen, coord, prompt_csv, prompt_file, prompts_file;
+     bool dry_protocol = false;
++    std::mt19937 rng(42);  // fixed seed for reproducibility
+ 
+     for (int i = 1; i < argc; ++i) {
+         auto need = [&](const char* flag) -> const char* {
+@@ -113,7 +132,11 @@ int main(int argc, char** argv) {
+         else if (!std::strcmp(argv[i], "--prompt-ids")) prompt_csv = need("--prompt-ids");
+         else if (!std::strcmp(argv[i], "--prompt-ids-file"))
+             prompt_file = need("--prompt-ids-file");
++        else if (!std::strcmp(argv[i], "--prompts-file"))
++            prompts_file = need("--prompts-file");
+         else if (!std::strcmp(argv[i], "--n-predict")) n_predict = std::atoi(need("--n-predict"));
++        else if (!std::strcmp(argv[i], "--temperature")) temperature = std::atof(need("--temperature"));
++        else if (!std::strcmp(argv[i], "--top-k")) top_k = std::atoi(need("--top-k"));
+         else if (!std::strcmp(argv[i], "--max-ctx")) max_ctx = std::atoi(need("--max-ctx"));
+         else if (!std::strcmp(argv[i], "--session-id"))
+             session_id = (std::uint64_t)std::strtoull(need("--session-id"), nullptr, 10);
+@@ -158,7 +181,6 @@ int main(int argc, char** argv) {
+ 
+     TransportConfig tcfg;
+     tcfg.connect_timeout = std::chrono::milliseconds(120000);
+-    // Full Neuron load on GB10 can take ~30+ minutes per rank; keep headroom.
+     tcfg.recv_timeout = std::chrono::milliseconds(5400000);   // 90 min
+     tcfg.phase_timeout = std::chrono::milliseconds(5400000);  // 90 min
+ 
+@@ -213,15 +235,11 @@ int main(int argc, char** argv) {
+         std::printf("[rank0] listening %s:%u — waiting for %d workers\n", host.c_str(),
+                     (unsigned)ctr.port(), world - 1);
+ 
+-        // NCCL: rank0 must call InitRank concurrently with workers. Start it inside
+-        // the id provider on a background thread BEFORE the id is dispatched.
+         NcclUniqueId nccl_id{};
+         std::thread nccl_thr;
+         std::string nccl_err;
+         std::atomic<bool> nccl_ok{false};
+ 
+-        // Load runs INSIDE bootstrap after BeginLoad / WaitingLoadReady, then rank0
+-        // LoadReady is injected exactly once (see CoordinatorTransport::bootstrap).
+         if (!ctr.bootstrap(
+                 [&](NcclUniqueId* id, std::string* e) {
+                     if (!make_nccl_unique_id_bytes(id, e)) return false;
+@@ -256,13 +274,27 @@ int main(int argc, char** argv) {
+         }
+         gen_trace("rank0 bootstrap+load complete; starting prompt loop");
+ 
+-        std::vector<int> prompt;
+-        if (!prompt_file.empty()) prompt = load_ids_file(prompt_file);
+-        else if (!prompt_csv.empty()) prompt = parse_ids_csv(prompt_csv);
+-        else prompt = {1};
+-        if (prompt.empty()) {
+-            std::fprintf(stderr, "empty prompt ids\n");
+-            return 2;
++        // Load prompts: multi-prompt file has priority
++        std::vector<std::vector<int>> all_prompts;
++        if (!prompts_file.empty()) {
++            all_prompts = load_multi_prompts(prompts_file);
++            if (all_prompts.empty()) {
++                std::fprintf(stderr, "no prompts in %s\n", prompts_file.c_str());
++                return 2;
++            }
++            std::fprintf(stderr, "[k3-dist] loaded %zu prompts from %s\n",
++                         all_prompts.size(), prompts_file.c_str());
++        } else {
++            // Single prompt mode (original behavior)
++            std::vector<int> prompt;
++            if (!prompt_file.empty()) prompt = load_ids_file(prompt_file);
++            else if (!prompt_csv.empty()) prompt = parse_ids_csv(prompt_csv);
++            else prompt = {1};
++            if (prompt.empty()) {
++                std::fprintf(stderr, "empty prompt ids\n");
++                return 2;
++            }
++            all_prompts.push_back(std::move(prompt));
+         }
+ 
+         std::vector<float> logits((size_t)dist.cfg.vocab);
+@@ -278,15 +310,22 @@ int main(int argc, char** argv) {
+                 std::fflush(stderr);
+                 return false;
+             }
+-            gen_trace("rank0 begin_step ok; forward enter");
+-            if (!kimi_k3_dist_forward_token(dist, *coll, tok, logits_out, &err)) {
+-                std::fprintf(stderr, "forward: %s\n", err.c_str());
+-                std::fflush(stderr);
+-                ctr.complete_local_step(false, 1, err, nullptr);
+-                ctr.fail(err, nullptr);
+-                return false;
++            gen_trace("rank0 begin_step ok");
++            if (tok == -2) {
++                // Reset sentinel: reset KV cache instead of forward
++                kimi_k3_reset_state(dist.state);
++                gen_trace("rank0 reset_state done (sentinel -2)");
++            } else {
++                gen_trace("rank0 forward enter");
++                if (!kimi_k3_dist_forward_token(dist, *coll, tok, logits_out, &err)) {
++                    std::fprintf(stderr, "forward: %s\n", err.c_str());
++                    std::fflush(stderr);
++                    ctr.complete_local_step(false, 1, err, nullptr);
++                    ctr.fail(err, nullptr);
++                    return false;
++                }
++                gen_trace("rank0 forward ok");
+             }
+-            gen_trace("rank0 forward ok; complete_local_step");
+             if (!ctr.complete_local_step(true, 0, "", &err)) {
+                 std::fprintf(stderr, "complete_local_step: %s\n", err.c_str());
+                 std::fflush(stderr);
+@@ -303,54 +342,140 @@ int main(int argc, char** argv) {
+         };
+ 
+         using clock = std::chrono::steady_clock;
+-        const auto t_prefill0 = clock::now();
+-        for (size_t i = 0; i < prompt.size(); ++i) {
+-            float* lp = (i + 1 == prompt.size()) ? logits.data() : nullptr;
+-            if (!one_step(prompt[i], lp)) return 1;
+-        }
+-        const auto t_prefill1 = clock::now();
+-        const double prefill_s =
+-            std::chrono::duration<double>(t_prefill1 - t_prefill0).count();
+-        std::printf("prefill done (%zu toks) in %.3fs\n", prompt.size(), prefill_s);
+-        std::fflush(stdout);
+-        std::fprintf(stderr,
+-                     "[k3-dist][tps] prefill_tokens=%zu prefill_s=%.6f prefill_tok_s=%.4f\n",
+-                     prompt.size(), prefill_s,
+-                     prefill_s > 0 ? (double)prompt.size() / prefill_s : 0.0);
+-        std::fflush(stderr);
++        double total_prefill_s = 0, total_gen_s = 0;
++        int total_gen_tokens = 0;
+ 
+-        std::vector<int> generated;
+-        const auto t_gen0 = clock::now();
+-        for (int n = 0; n < n_predict; ++n) {
+-            const int next = kimi_k3_dist_argmax(logits.data(), dist.cfg.vocab);
+-            generated.push_back(next);
+-            std::printf(" gen[%d]=%d\n", n, next);
++        std::fprintf(stderr, "[k3-dist] sampling: temperature=%.2f top_k=%d (0=greedy argmax)\n", temperature, top_k);
++        for (size_t pi = 0; pi < all_prompts.size(); ++pi) {
++            const auto& prompt = all_prompts[pi];
++
++            std::fprintf(stderr, "[k3-dist] === prompt %zu/%zu (%zu tokens) ===\n",
++                         pi + 1, all_prompts.size(), prompt.size());
++            std::fflush(stderr);
++            // Reset KV cache between prompts (sentinel token -2)
++            if (pi > 0) {
++                gen_trace("rank0 sending reset sentinel");
++                if (!one_step(-2, nullptr)) return 1;
++                gen_trace("rank0 reset sentinel done");
++            }
++            std::printf("=== PROMPT %zu ===\n", pi);
+             std::fflush(stdout);
+-            {
+-                char buf[96];
+-                std::snprintf(buf, sizeof(buf), "rank0 gen[%d]=%d", n, next);
+-                gen_trace(buf);
++
++            // Prefill
++            const auto t_prefill0 = clock::now();
++            for (size_t i = 0; i < prompt.size(); ++i) {
++                float* lp = (i + 1 == prompt.size()) ? logits.data() : nullptr;
++                if (!one_step(prompt[i], lp)) return 1;
+             }
+-            if (!one_step(next, logits.data())) return 1;
++            const auto t_prefill1 = clock::now();
++            const double prefill_s =
++                std::chrono::duration<double>(t_prefill1 - t_prefill0).count();
++            total_prefill_s += prefill_s;
++            std::printf("prefill done (%zu toks) in %.3fs\n", prompt.size(), prefill_s);
++            std::fflush(stdout);
++            std::fprintf(stderr,
++                         "[k3-dist][tps] prompt=%zu prefill_tokens=%zu prefill_s=%.6f prefill_tok_s=%.4f\n",
++                         pi, prompt.size(), prefill_s,
++                         prefill_s > 0 ? (double)prompt.size() / prefill_s : 0.0);
++            std::fflush(stderr);
++
++            // Generate
++            std::vector<int> generated;
++            const auto t_gen0 = clock::now();
++            for (int n = 0; n < n_predict; ++n) {
++                // DEBUG: dump top-5 logits before argmax
++                if (n < 5) {
++                    struct IdxVal { int idx; float val; };
++                    IdxVal top[5] = {};
++                    for (int i = 0; i < 5; i++) top[i] = {0, -1e30f};
++                    for (int i = 0; i < (int)dist.cfg.vocab; i++) {
++                        float v = logits.data()[i];
++                        if (v > top[4].val) {
++                            top[4] = {i, v};
++                            for (int j = 3; j >= 0; j--) {
++                                if (top[j+1].val > top[j].val) std::swap(top[j], top[j+1]);
++                                else break;
++                            }
++                        }
++                    }
++                    std::fprintf(stderr, "[LOGIT-DBG gen=%d] ", n);
++                    for (int i = 0; i < 5; i++)
++                        std::fprintf(stderr, "tok%d=%d(%.3f) ", i, top[i].idx, top[i].val);
++                    float mn=1e30f, mx=-1e30f; int nan_c=0;
++                    for (int i = 0; i < (int)dist.cfg.vocab; i++) {
++                        float v = logits.data()[i];
++                        if (v!=v) nan_c++;
++                        else { mn=std::min(mn,v); mx=std::max(mx,v); }
++                    }
++                    std::fprintf(stderr, "min=%.3f max=%.3f nan=%d\n", mn, mx, nan_c);
++                    std::fflush(stderr);
++                }
++                // Temperature + top-k sampling
++                int next;
++                if (temperature <= 0.0f) {
++                    next = kimi_k3_dist_argmax(logits.data(), dist.cfg.vocab);
++                } else {
++                    // Apply temperature
++                    std::vector<float> scaled(dist.cfg.vocab);
++                    for (int _i = 0; _i < (int)dist.cfg.vocab; _i++) scaled[_i] = logits.data()[_i] / temperature;
++                    // Top-k filtering
++                    if (top_k > 0 && top_k < (int)dist.cfg.vocab) {
++                        std::vector<float> sv(scaled);
++                        std::nth_element(sv.begin(), sv.begin() + top_k, sv.end(), std::greater<float>());
++                        float cutoff = sv[top_k - 1];
++                        for (int _i = 0; _i < (int)dist.cfg.vocab; _i++) if (scaled[_i] < cutoff) scaled[_i] = -1e30f;
++                    }
++                    // Softmax
++                    float mx = *std::max_element(scaled.begin(), scaled.end());
++                    float sum = 0.0f;
++                    for (int _i = 0; _i < (int)dist.cfg.vocab; _i++) { scaled[_i] = std::exp(scaled[_i] - mx); sum += scaled[_i]; }
++                    for (int _i = 0; _i < (int)dist.cfg.vocab; _i++) scaled[_i] /= sum;
++                    std::discrete_distribution<int> dist_sampler(scaled.begin(), scaled.end());
++                    next = dist_sampler(rng);
++                }
++                generated.push_back(next);
++                std::printf(" gen[%d]=%d\n", n, next);
++                std::fflush(stdout);
++                {
++                    char buf[96];
++                    std::snprintf(buf, sizeof(buf), "rank0 prompt=%zu gen[%d]=%d", pi, n, next);
++                    gen_trace(buf);
++                }
++                if (!one_step(next, logits.data())) return 1;
++            }
++            const auto t_gen1 = clock::now();
++            const double gen_s = std::chrono::duration<double>(t_gen1 - t_gen0).count();
++            const double decode_tps = gen_s > 0 ? (double)n_predict / gen_s : 0.0;
++            total_gen_s += gen_s;
++            total_gen_tokens += n_predict;
++
++            std::printf("generated %zu tokens in %.3fs (decode_tok_s=%.4f)\n",
++                        generated.size(), gen_s, decode_tps);
++            std::fflush(stdout);
++            std::fprintf(stderr,
++                         "[k3-dist][tps] prompt=%zu decode_tokens=%d decode_s=%.6f decode_tok_s=%.4f\n",
++                         pi, n_predict, gen_s, decode_tps);
++            std::fprintf(stderr, "[k3-dist][tps] prompt=%zu generated_ids=", pi);
++            for (size_t i = 0; i < generated.size(); ++i) {
++                std::fprintf(stderr, "%s%d", i ? "," : "", generated[i]);
++            }
++            std::fprintf(stderr, "\n");
++            std::fflush(stderr);
+         }
+-        const auto t_gen1 = clock::now();
+-        const double gen_s = std::chrono::duration<double>(t_gen1 - t_gen0).count();
+-        // Decode TPS: n_predict forward steps after first logits (each step emits one token).
+-        const double decode_tps = gen_s > 0 ? (double)n_predict / gen_s : 0.0;
+-        std::printf("OK generated %zu tokens in %.3fs (decode_tok_s=%.4f)\n", generated.size(),
+-                    gen_s, decode_tps);
++
++        // Summary
++        const double total_decode_tps = total_gen_s > 0 ? (double)total_gen_tokens / total_gen_s : 0.0;
++        std::printf("\n=== SUMMARY ===\n");
++        std::printf("prompts=%zu total_prefill_s=%.3f total_gen_s=%.3f\n",
++                    all_prompts.size(), total_prefill_s, total_gen_s);
++        std::printf("total_gen_tokens=%d avg_decode_tok_s=%.4f\n",
++                    total_gen_tokens, total_decode_tps);
+         std::fflush(stdout);
+-        std::fprintf(stderr,
+-                     "[k3-dist][tps] decode_tokens=%d decode_s=%.6f decode_tok_s=%.4f\n",
+-                     n_predict, gen_s, decode_tps);
+-        std::fprintf(stderr, "[k3-dist][tps] generated_ids=");
+-        for (size_t i = 0; i < generated.size(); ++i) {
+-            std::fprintf(stderr, "%s%d", i ? "," : "", generated[i]);
+-        }
+-        std::fprintf(stderr, "\n");
++        std::fprintf(stderr, "[k3-dist][tps] summary prompts=%zu total_prefill_s=%.6f total_gen_s=%.6f total_gen_tokens=%d avg_decode_tok_s=%.4f\n",
++                     all_prompts.size(), total_prefill_s, total_gen_s, total_gen_tokens, total_decode_tps);
+         std::fflush(stderr);
+-        gen_trace("rank0 finish enter");
+ 
++        gen_trace("rank0 finish enter");
+         if (!ctr.finish(&err)) {
+             std::fprintf(stderr, "finish: %s\n", err.c_str());
+             std::fflush(stderr);
+@@ -415,16 +540,26 @@ int main(int argc, char** argv) {
+             std::snprintf(buf, sizeof(buf), "rank%d wait_token got tok=%d; forward enter", rank, tok);
+             gen_trace(buf);
+         }
+-        if (!kimi_k3_dist_forward_token(dist, *coll, tok, nullptr, &err)) {
+-            wtr.report_step_done(false, 1, err, nullptr);
+-            std::fprintf(stderr, "forward: %s\n", err.c_str());
+-            std::fflush(stderr);
+-            return 1;
+-        }
+-        {
+-            char buf[64];
+-            std::snprintf(buf, sizeof(buf), "rank%d forward ok; StepDone", rank);
+-            gen_trace(buf);
++        if (tok == -2) {
++            // Reset sentinel: reset KV cache instead of forward
++            kimi_k3_reset_state(dist.state);
++            {
++                char buf[64];
++                std::snprintf(buf, sizeof(buf), "rank%d reset_state done (sentinel -2)", rank);
++                gen_trace(buf);
++            }
++        } else {
++            if (!kimi_k3_dist_forward_token(dist, *coll, tok, nullptr, &err)) {
++                wtr.report_step_done(false, 1, err, nullptr);
++                std::fprintf(stderr, "forward: %s\n", err.c_str());
++                std::fflush(stderr);
++                return 1;
++            }
++            {
++                char buf[64];
++                std::snprintf(buf, sizeof(buf), "rank%d forward ok; StepDone", rank);
++                gen_trace(buf);
++            }
+         }
+         if (!wtr.report_step_done(true, 0, "", &err)) {
+             std::fprintf(stderr, "step_done: %s\n", err.c_str());
+-- 
+2.43.0
+
