@@ -1,0 +1,223 @@
+From b3cfb4390c15c5e8d5f97c68dd1b340fe49664af Mon Sep 17 00:00:00 2001
+From: Hermes <hermes@local>
+Date: Fri, 7 Aug 2026 22:03:40 -0700
+Subject: [PATCH 10/12] tp: 0010 stall breadcrumbs for first distributed
+ forward
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+External 0009 GB10 qual: 3/3 load OK, no embed_token failed, then silent
+stall ~1h39m with 0 tokens. Add fflush'd stderr traces:
+
+- gen: bootstrap done, begin_step, forward, pump, wait_token got/enter
+- fwd: embed enter/ok, first attn allreduce, layer 0/16/.../last
+
+Instrumentation only — no protocol/forward algorithm change.
+---
+ runtime/examples/kimi_k3_dist_generate.cpp  | 47 +++++++++++++++++++++
+ runtime/src/models/kimi_k3_dist_forward.cpp | 32 ++++++++++++++
+ 2 files changed, 79 insertions(+)
+
+diff --git a/runtime/examples/kimi_k3_dist_generate.cpp b/runtime/examples/kimi_k3_dist_generate.cpp
+index 781e79a..1a197c4 100644
+--- a/runtime/examples/kimi_k3_dist_generate.cpp
++++ b/runtime/examples/kimi_k3_dist_generate.cpp
+@@ -34,6 +34,14 @@ using namespace sparkinfer::tp::dist;
+ 
+ namespace {
+ 
++void gen_trace(const char* msg) {
++    using clock = std::chrono::steady_clock;
++    static const auto t0 = clock::now();
++    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t0).count();
++    std::fprintf(stderr, "[k3-dist][gen +%lldms] %s\n", (long long)ms, msg);
++    std::fflush(stderr);
++}
++
+ void usage(const char* argv0) {
+     std::fprintf(stderr,
+                  "usage: %s --rank R --world 3|4 (--listen HOST:PORT | --coord HOST:PORT)\n"
+@@ -246,6 +254,7 @@ int main(int argc, char** argv) {
+             std::fprintf(stderr, "rank0 NCCL init failed: %s\n", nccl_err.c_str());
+             return 1;
+         }
++        gen_trace("rank0 bootstrap+load complete; starting prompt loop");
+ 
+         std::vector<int> prompt;
+         if (!prompt_file.empty()) prompt = load_ids_file(prompt_file);
+@@ -259,24 +268,37 @@ int main(int argc, char** argv) {
+         std::vector<float> logits((size_t)dist.cfg.vocab);
+ 
+         auto one_step = [&](int tok, float* logits_out) -> bool {
++            {
++                char buf[96];
++                std::snprintf(buf, sizeof(buf), "rank0 begin_step enter tok=%d", tok);
++                gen_trace(buf);
++            }
+             if (!ctr.begin_step(tok, &err)) {
+                 std::fprintf(stderr, "begin_step: %s\n", err.c_str());
++                std::fflush(stderr);
+                 return false;
+             }
++            gen_trace("rank0 begin_step ok; forward enter");
+             if (!kimi_k3_dist_forward_token(dist, *coll, tok, logits_out, &err)) {
+                 std::fprintf(stderr, "forward: %s\n", err.c_str());
++                std::fflush(stderr);
+                 ctr.complete_local_step(false, 1, err, nullptr);
+                 ctr.fail(err, nullptr);
+                 return false;
+             }
++            gen_trace("rank0 forward ok; complete_local_step");
+             if (!ctr.complete_local_step(true, 0, "", &err)) {
+                 std::fprintf(stderr, "complete_local_step: %s\n", err.c_str());
++                std::fflush(stderr);
+                 return false;
+             }
++            gen_trace("rank0 pump wait workers StepDone");
+             if (!ctr.pump(std::chrono::milliseconds(600000), &err)) {
+                 std::fprintf(stderr, "pump: %s\n", err.c_str());
++                std::fflush(stderr);
+                 return false;
+             }
++            gen_trace("rank0 step complete");
+             return true;
+         };
+ 
+@@ -324,28 +346,53 @@ int main(int argc, char** argv) {
+             },
+             [&](std::string* e) { return do_load(e); }, &err)) {
+         std::fprintf(stderr, "worker bootstrap: %s\n", err.c_str());
++        std::fflush(stderr);
+         return 1;
+     }
++    {
++        char buf[80];
++        std::snprintf(buf, sizeof(buf), "rank%d bootstrap+load complete; wait_token loop", rank);
++        gen_trace(buf);
++    }
+ 
+     for (;;) {
+         int tok = -1;
++        {
++            char buf[64];
++            std::snprintf(buf, sizeof(buf), "rank%d wait_token enter", rank);
++            gen_trace(buf);
++        }
+         if (!wtr.wait_token(&tok, &err)) {
+             if (wtr.state() == RankState::Finished || wtr.state() == RankState::FinishPending) {
+                 wtr.wait_finished(nullptr);
+                 std::printf("[rank %d] finished\n", rank);
++                std::fflush(stdout);
+                 kimi_k3_dist_rank_free(&dist);
+                 return 0;
+             }
+             std::fprintf(stderr, "wait_token: %s state=%d\n", err.c_str(), (int)wtr.state());
++            std::fflush(stderr);
+             return 1;
+         }
++        {
++            char buf[96];
++            std::snprintf(buf, sizeof(buf), "rank%d wait_token got tok=%d; forward enter", rank, tok);
++            gen_trace(buf);
++        }
+         if (!kimi_k3_dist_forward_token(dist, *coll, tok, nullptr, &err)) {
+             wtr.report_step_done(false, 1, err, nullptr);
+             std::fprintf(stderr, "forward: %s\n", err.c_str());
++            std::fflush(stderr);
+             return 1;
+         }
++        {
++            char buf[64];
++            std::snprintf(buf, sizeof(buf), "rank%d forward ok; StepDone", rank);
++            gen_trace(buf);
++        }
+         if (!wtr.report_step_done(true, 0, "", &err)) {
+             std::fprintf(stderr, "step_done: %s\n", err.c_str());
++            std::fflush(stderr);
+             return 1;
+         }
+     }
+diff --git a/runtime/src/models/kimi_k3_dist_forward.cpp b/runtime/src/models/kimi_k3_dist_forward.cpp
+index 3003dcb..5ccdfcb 100755
+--- a/runtime/src/models/kimi_k3_dist_forward.cpp
++++ b/runtime/src/models/kimi_k3_dist_forward.cpp
+@@ -3,6 +3,7 @@
+ #include "sparkinfer/kernels/kimi_k3.h"
+ 
+ #include <cstdint>
++#include <chrono>
+ #include <cstdio>
+ #include <cstring>
+ #include <vector>
+@@ -12,6 +13,15 @@ namespace k3k = sparkinfer::kernels::k3;
+ namespace sparkinfer {
+ namespace {
+ 
++
++void dist_trace(const char* msg) {
++    using clock = std::chrono::steady_clock;
++    static const auto t0 = clock::now();
++    const auto ms = std::chrono::duration_cast<std::chrono::milliseconds>(clock::now() - t0).count();
++    std::fprintf(stderr, "[k3-dist][fwd +%lldms] %s\n", (long long)ms, msg);
++    std::fflush(stderr);
++}
++
+ void set_err(std::string* error, const std::string& v) {
+     if (error) *error = v;
+ }
+@@ -103,10 +113,20 @@ bool kimi_k3_dist_forward_token(KimiK3DistRank& rank,
+ 
+     rank.state.n_ckpt = 0;
+ 
++    {
++        char buf[96];
++        std::snprintf(buf, sizeof(buf), "rank%d embed_token enter tok=%d", my_rank, token_id);
++        dist_trace(buf);
++    }
+     if (!embed_token(w, cfg, token_id, rank.x, rank.stream)) {
+         set_err(error, "embed_token failed");
+         return false;
+     }
++    {
++        char buf[96];
++        std::snprintf(buf, sizeof(buf), "rank%d embed_token ok tok=%d", my_rank, token_id);
++        dist_trace(buf);
++    }
+ 
+     long n_coll = 0;
+     for (int layer = 0; layer < cfg.n_layers; ++layer) {
+@@ -123,11 +143,17 @@ bool kimi_k3_dist_forward_token(KimiK3DistRank& rank,
+         }
+ 
+         if (attn_reduce) {
++            if (layer == 0) {
++                char buf[96];
++                std::snprintf(buf, sizeof(buf), "rank%d first attn allreduce enter L0", my_rank);
++                dist_trace(buf);
++            }
+             if (!allreduce_partial(fwd, layer, K3LayerPhase::Attn, coll, rank.stream, error)) {
+                 if (error && error->empty())
+                     set_err(error, "attn allreduce failed layer " + std::to_string(layer));
+                 return false;
+             }
++            if (layer == 0) dist_trace("first attn allreduce ok L0");
+             ++n_coll;
+             if (!kimi_k3_forward_layer_phase(fwd, layer, K3LayerPhase::FfnPartial, rank.x,
+                                              rank.x_next)) {
+@@ -160,6 +186,12 @@ bool kimi_k3_dist_forward_token(KimiK3DistRank& rank,
+             return false;
+         }
+         std::swap(rank.x, rank.x_next);
++        if (layer == 0 || layer + 1 == cfg.n_layers || ((layer + 1) % 16) == 0) {
++            char buf[128];
++            std::snprintf(buf, sizeof(buf), "rank%d layer %d/%d done coll=%ld", my_rank, layer + 1,
++                          cfg.n_layers, n_coll);
++            dist_trace(buf);
++        }
+     }
+ 
+     // Head: only rank 0 holds output.weight under dist load policy.
+-- 
+2.43.0
+

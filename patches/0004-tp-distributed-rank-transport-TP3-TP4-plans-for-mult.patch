@@ -1,0 +1,2171 @@
+From 1bf35a3f1c74dc61fdd236eaef20462b5678a7a0 Mon Sep 17 00:00:00 2001
+From: Hermes <hermes@local>
+Date: Fri, 7 Aug 2026 04:29:16 -0700
+Subject: [PATCH 04/12] tp: distributed rank transport + TP3/TP4 plans for
+ multi-Spark
+
+Add TCP framed control-plane adapter, one-rank-per-process collective
+API (host mock + NCCL InitRank), validate world=3 AllExpertsFfnWidth and
+world=4 ExpertFfn2D, and CPU tests for protocol dry-run + sockets.
+
+Not yet a full-model multi-Spark generator: rank-local GGUF load and
+eager K3 forward remain the next milestones.
+---
+ .../include/sparkinfer/tp/rank_collective.h   |   78 ++
+ runtime/include/sparkinfer/tp/rank_protocol.h |   18 +-
+ .../include/sparkinfer/tp/rank_transport.h    |  221 ++++
+ runtime/src/tp/rank_collective.cpp            |  294 +++++
+ runtime/src/tp/rank_protocol.cpp              |   37 +-
+ runtime/src/tp/rank_transport_tcp.cpp         | 1143 +++++++++++++++++
+ runtime/tests/CMakeLists.txt                  |   13 +-
+ runtime/tests/tp3_rank_protocol_cpu_test.cpp  |   14 +-
+ runtime/tests/tp_dist_rank_cpu_test.cpp       |  211 +++
+ 9 files changed, 2010 insertions(+), 19 deletions(-)
+ create mode 100644 runtime/include/sparkinfer/tp/rank_collective.h
+ create mode 100644 runtime/include/sparkinfer/tp/rank_transport.h
+ create mode 100644 runtime/src/tp/rank_collective.cpp
+ create mode 100644 runtime/src/tp/rank_transport_tcp.cpp
+ create mode 100644 runtime/tests/tp_dist_rank_cpu_test.cpp
+
+diff --git a/runtime/include/sparkinfer/tp/rank_collective.h b/runtime/include/sparkinfer/tp/rank_collective.h
+new file mode 100644
+index 0000000..99261e2
+--- /dev/null
++++ b/runtime/include/sparkinfer/tp/rank_collective.h
+@@ -0,0 +1,78 @@
++#pragma once
++// One-rank-per-process collective API for distributed Spark TP.
++//
++// Distinct from Collective (single-process, vector-of-devices, ncclCommInitAll).
++// Do not overload that class: remote ranks have no local device pointers and
++// cannot join InitAll.
++//
++// This header stays free of NCCL includes so CPU CI can compile the type and a
++// host-memory mock. The NCCL implementation is selected at link/runtime when
++// SPARKINFER_TP_NCCL is defined.
++
++#include "sparkinfer/tp/rank_protocol.h"
++
++#include <cstddef>
++#include <cstdint>
++#include <memory>
++#include <string>
++
++namespace sparkinfer {
++namespace tp {
++namespace dist {
++
++// Opaque stream handle so the header stays CUDA-free. Callers cast to/from
++// cudaStream_t at the boundary (0 means the default stream / host mock).
++using RankStreamHandle = std::uintptr_t;
++
++class RankCollective {
++public:
++    virtual ~RankCollective() = default;
++
++    virtual int world_size() const = 0;
++    virtual int rank() const = 0;
++    virtual bool supports_f32() const = 0;
++
++    // In-place sum-reduce of `count` float32 elements in device (or host-mock)
++    // memory. False is fatal — partial reductions look like quality bugs.
++    virtual bool allreduce_f32(void* buf, std::size_t count,
++                               RankStreamHandle stream = 0) = 0;
++
++    // Optional bf16 path for non-K3 workloads; may return false if unsupported.
++    virtual bool allreduce_bf16(void* buf, std::size_t count,
++                                RankStreamHandle stream = 0) {
++        (void)buf;
++        (void)count;
++        (void)stream;
++        return false;
++    }
++
++    virtual bool barrier(RankStreamHandle stream = 0) = 0;
++
++    // Poll NCCL async errors (or mock fault injection). Empty string => healthy.
++    virtual bool poll_async_error(std::string* error = nullptr) = 0;
++
++    // Tear down hard. Required on Abort so peers do not hang in collectives.
++    virtual bool abort() = 0;
++};
++
++// Host-memory mock for multi-process CPU tests. Uses a shared POSIX shm +
++// pthread barrier keyed by session name. Not for production.
++std::unique_ptr<RankCollective> make_host_mock_rank_collective(
++    int world_size, int rank, const std::string& session_key, std::string* error);
++
++// Produce an opaque 128-byte id. With NCCL, wraps ncclGetUniqueId. Without NCCL,
++// fills a deterministic non-zero test pattern (still 128 bytes).
++bool make_nccl_unique_id_bytes(NcclUniqueId* out, std::string* error = nullptr);
++
++// Real NCCL rank communicator. Returns nullptr when SPARKINFER_TP_NCCL is off
++// or init fails. Requires CUDA device `local_device` visible in this process.
++std::unique_ptr<RankCollective> make_nccl_rank_collective(
++    int world_size, int rank, int local_device, const NcclUniqueId& id,
++    std::string* error);
++
++// static_assert bridge compiled only in the .cpp when NCCL headers are present:
++// sizeof(ncclUniqueId) == kNcclUniqueIdBytes.
++
++}  // namespace dist
++}  // namespace tp
++}  // namespace sparkinfer
+diff --git a/runtime/include/sparkinfer/tp/rank_protocol.h b/runtime/include/sparkinfer/tp/rank_protocol.h
+index db14508..7844136 100644
+--- a/runtime/include/sparkinfer/tp/rank_protocol.h
++++ b/runtime/include/sparkinfer/tp/rank_protocol.h
+@@ -21,7 +21,13 @@ namespace dist {
+ 
+ constexpr std::uint16_t kProtocolVersion = 1;
+ constexpr int kK3Tp3WorldSize = 3;
++constexpr int kK3Tp4WorldSize = 4;
+ constexpr int kNcclUniqueIdBytes = 128;
++
++// Supported multi-Spark world sizes for the Neuron release geometry.
++inline bool supported_k3_dist_world_size(int world_size) {
++    return world_size == kK3Tp3WorldSize || world_size == kK3Tp4WorldSize;
++}
+ constexpr std::size_t kDigestBytes = 32;
+ constexpr std::size_t kMaxDetailBytes = 256;
+ constexpr std::size_t kWireHeaderBytes = 16;
+@@ -55,11 +61,11 @@ enum class Phase : std::uint16_t {
+     Shutdown = 5,
+ };
+ 
+-// One process owns one local device. All three DGX Sparks may therefore use local
+-// CUDA ordinal 0 while retaining distinct GLOBAL ranks 0/1/2.
++// One process owns one local device. Separate DGX Sparks each use local CUDA
++// ordinal 0 while retaining distinct GLOBAL ranks 0..world_size-1.
+ struct RankSpec {
+     std::uint64_t session_id = 0;
+-    int world_size = kK3Tp3WorldSize;
++    int world_size = kK3Tp3WorldSize;  // 3 (AllExpertsFfnWidth) or 4 (ExpertFfn2D)
+     int rank = 0;
+     int local_device = 0;
+     int n_experts = 896;
+@@ -70,9 +76,9 @@ struct RankSpec {
+     Digest plan_digest{};
+ };
+ 
+-// Validates the exact three-Spark target and returns this rank's all-expert width
+-// plan. The returned descriptor always has expert_band=[0,896) and a 512-wide FFN
+-// band on the rank's correct third.
++// Validates a supported multi-Spark target and returns this rank's MoE plan:
++//   world=3 -> AllExpertsFfnWidth, experts [0,896), FFN 512/512/512
++//   world=4 -> ExpertFfn2D eg=2/fs=2, 448 experts/group, FFN 768/768
+ ShardError validate_rank_spec(const RankSpec& spec, ShardDims* out);
+ 
+ // Fixed-schema message. Every frame carries the cluster identity, so a delayed
+diff --git a/runtime/include/sparkinfer/tp/rank_transport.h b/runtime/include/sparkinfer/tp/rank_transport.h
+new file mode 100644
+index 0000000..7292215
+--- /dev/null
++++ b/runtime/include/sparkinfer/tp/rank_transport.h
+@@ -0,0 +1,221 @@
++#pragma once
++// TCP control-plane adapter for one K3 TP rank per physical host.
++//
++// Drives the CUDA-free rank_protocol state machines over framed sockets.
++// Deliberately independent of NCCL/CUDA so three/four localhost processes can
++// prove bootstrap, token lockstep, Abort, and Finish before any GPU work lands.
++//
++// Contract highlights (must match docs/k3-tp3-distributed-rank-protocol.md):
++//   - reject declared payload outside 250..506 before body allocation
++//   - bind each live connection to exactly one configured global rank
++//   - reject spoofed in-band ranks and second connections for a bound rank
++//   - deadlines on connect / phase waits; sticky failure + Abort broadcast
++//   - dedicated receive path so Abort can land while a compute wait is blocked
++
++#include "sparkinfer/tp/rank_protocol.h"
++
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <functional>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <thread>
++#include <vector>
++
++namespace sparkinfer {
++namespace tp {
++namespace dist {
++
++struct TransportConfig {
++    // Coordinator listen address. Workers connect here.
++    std::string host = "127.0.0.1";
++    uint16_t port = 0;  // 0 => ephemeral; filled after bind when hosting
++    // Wall deadlines. Zero disables that particular deadline (tests only).
++    std::chrono::milliseconds connect_timeout{5000};
++    std::chrono::milliseconds recv_timeout{10000};
++    std::chrono::milliseconds phase_timeout{30000};
++    // Static rank binding for worker connections (configured peer map).
++    // peers[i] is the expected source address token for global rank i, or empty
++    // to accept any peer and bind solely by the first Hello (lab/localhost).
++    std::vector<std::string> peer_tokens;
++};
++
++// Blocking framed send/recv. Rejects oversize headers before body allocation.
++class FramedSocket {
++public:
++    FramedSocket() = default;
++    explicit FramedSocket(int fd);
++    FramedSocket(FramedSocket&& other) noexcept;
++    FramedSocket& operator=(FramedSocket&& other) noexcept;
++    ~FramedSocket();
++
++    FramedSocket(const FramedSocket&) = delete;
++    FramedSocket& operator=(const FramedSocket&) = delete;
++
++    bool valid() const { return fd_ >= 0; }
++    int fd() const { return fd_; }
++    void close();
++
++    bool set_recv_timeout(std::chrono::milliseconds timeout, std::string* error = nullptr);
++    bool set_send_timeout(std::chrono::milliseconds timeout, std::string* error = nullptr);
++
++    bool send_message(const Message& message, std::string* error = nullptr);
++    bool recv_message(Message* message, std::string* error = nullptr);
++
++private:
++    int fd_ = -1;
++    bool send_all(const std::uint8_t* data, std::size_t n, std::string* error);
++    bool recv_all(std::uint8_t* data, std::size_t n, std::string* error);
++};
++
++// Listen socket for the coordinator.
++class TcpListener {
++public:
++    TcpListener() = default;
++    ~TcpListener();
++    TcpListener(const TcpListener&) = delete;
++    TcpListener& operator=(const TcpListener&) = delete;
++
++    bool listen(const std::string& host, uint16_t port, std::string* error = nullptr);
++    uint16_t bound_port() const { return port_; }
++    // Accept one connection with optional timeout (0 = block forever).
++    bool accept(FramedSocket* out, std::chrono::milliseconds timeout,
++                std::string* peer_addr = nullptr, std::string* error = nullptr);
++    void close();
++
++private:
++    int fd_ = -1;
++    uint16_t port_ = 0;
++};
++
++bool tcp_connect(const std::string& host, uint16_t port,
++                 std::chrono::milliseconds timeout, FramedSocket* out,
++                 std::string* error = nullptr);
++
++// ----------------------------------------------------------------------------
++// High-level session runners
++// ----------------------------------------------------------------------------
++
++struct StepRecord {
++    std::uint64_t sequence = 0;
++    int token_id = -1;
++};
++
++// Rank 0: accept world_size-1 workers (or world_size peers including a loopback
++// self-socket when include_self_rank0 is true — production uses out-of-band
++// local RankSession without a self TCP link).
++//
++// Production layout: coordinator owns local RankSession for rank 0 in-process
++// and TCP links only to ranks 1..world-1.
++class CoordinatorTransport {
++public:
++    CoordinatorTransport(const RankSpec& cluster, TransportConfig cfg);
++    ~CoordinatorTransport();
++
++    // Bind/listen. Fills cfg_.port when ephemeral.
++    bool host(std::string* error = nullptr);
++    uint16_t port() const { return cfg_.port; }
++
++    // Accept workers, run Hello collection, install NCCL id (caller-supplied),
++    // wait NcclReady/LoadReady, then expose ready() for begin_step loops.
++    // nccl_id_provider is called once after all Hellos (typically ncclGetUniqueId
++    // or a deterministic test id).
++    bool bootstrap(const std::function<bool(NcclUniqueId*, std::string*)>& nccl_id_provider,
++                   std::string* error = nullptr);
++
++    bool ready() const;
++    CoordinatorState state() const;
++
++    bool begin_step(int token_id, std::string* error = nullptr);
++    bool finish(std::string* error = nullptr);
++    bool fail(const std::string& detail, std::string* error = nullptr);
++
++    // Drain worker messages until state changes or timeout.
++    bool pump(std::chrono::milliseconds budget, std::string* error = nullptr);
++
++private:
++    RankSpec cluster_;
++    TransportConfig cfg_;
++    TcpListener listener_;
++    Coordinator coord_;
++    // sockets_[rank] for ranks 1..world-1; rank 0 is local and has no socket.
++    std::vector<std::unique_ptr<FramedSocket>> sockets_;
++    std::vector<std::uint64_t> conn_ids_;
++    std::mutex mu_;
++    std::atomic<bool> stop_{false};
++    std::thread rx_thread_;
++    std::string last_error_;
++
++    bool send_to_rank(int rank, const Message& m, std::string* error);
++    bool broadcast_except(int except_rank, const std::vector<Message>& msgs,
++                          std::string* error);
++    bool dispatch_outbound(const std::vector<Message>& msgs, std::string* error);
++    void rx_loop();
++    bool handle_inbound(int rank, const Message& m, std::string* error);
++};
++
++// Worker ranks 1..world-1 (or any non-coordinator rank).
++class RankTransport {
++public:
++    RankTransport(const RankSpec& spec, TransportConfig cfg);
++    ~RankTransport();
++
++    // Connect, Hello, wait NcclUniqueId, invoke on_nccl_init, report ready,
++    // wait BeginLoad, invoke on_load, report ready, then wait tokens.
++    bool bootstrap(const std::function<bool(const NcclUniqueId&, std::string*)>& on_nccl_init,
++                   const std::function<bool(std::string*)>& on_load,
++                   std::string* error = nullptr);
++
++    // Block until next Token, Finish, or Abort. Returns false on failure/finish.
++    // When true, *token_id is the synchronized input and the caller must run the
++    // local forward then call report_step_done.
++    bool wait_token(int* token_id, std::string* error = nullptr);
++    bool report_step_done(bool success, int status, const std::string& detail,
++                          std::string* error = nullptr);
++    bool wait_finished(std::string* error = nullptr);
++
++    RankState state() const;
++    bool good() const;
++
++private:
++    RankSpec spec_;
++    TransportConfig cfg_;
++    RankSession session_;
++    FramedSocket sock_;
++    std::mutex mu_;
++
++    bool send(const Message& m, std::string* error);
++    bool recv(Message* m, std::string* error);
++};
++
++// Convenience: spawn-free multi-rank dry run on localhost using threads + TCP.
++// Each rank runs in a thread; rank 0 samples a fixed token sequence.
++// Used by CPU tests; not a production multi-host launcher.
++struct LocalhostDryRunConfig {
++    int world_size = 3;  // 3 or 4
++    std::vector<int> tokens{1, 2, 3};
++    std::chrono::milliseconds timeouts{5000};
++    Digest model_digest{};
++    Digest plan_digest{};
++    std::uint64_t session_id = 1;
++    int vocab = 163840;
++};
++
++struct LocalhostDryRunResult {
++    bool ok = false;
++    std::string error;
++    std::vector<std::vector<int>> tokens_seen_per_rank;
++    CoordinatorState final_coord_state = CoordinatorState::Failed;
++};
++
++LocalhostDryRunResult run_localhost_protocol_dry_run(const LocalhostDryRunConfig& cfg);
++
++// Build canonical plan digest bytes for the audited TP3 / TP4 geometries.
++// Not a cryptographic signature — identity string hashed by the caller or tests.
++std::string plan_identity_string(int world_size);
++
++}  // namespace dist
++}  // namespace tp
++}  // namespace sparkinfer
+diff --git a/runtime/src/tp/rank_collective.cpp b/runtime/src/tp/rank_collective.cpp
+new file mode 100644
+index 0000000..a731395
+--- /dev/null
++++ b/runtime/src/tp/rank_collective.cpp
+@@ -0,0 +1,294 @@
++// One-rank-per-process collectives: host mock + optional NCCL InitRank.
++
++#include "sparkinfer/tp/rank_collective.h"
++
++#include <condition_variable>
++#include <cstdio>
++#include <cstring>
++#include <memory>
++#include <mutex>
++#include <sstream>
++#include <unordered_map>
++#include <vector>
++
++#if defined(SPARKINFER_TP_NCCL)
++#include <cuda_runtime.h>
++#include <nccl.h>
++static_assert(sizeof(ncclUniqueId) == sparkinfer::tp::dist::kNcclUniqueIdBytes,
++              "ncclUniqueId size must match dist::kNcclUniqueIdBytes (128)");
++#endif
++
++namespace sparkinfer {
++namespace tp {
++namespace dist {
++namespace {
++
++void set_err(std::string* error, const std::string& value) {
++    if (error) *error = value;
++}
++
++// ---- Host mock: process-local multi-thread shared slots --------------------
++// Good enough for unit tests in one process. Multi-process shm can be layered
++// later; production uses NCCL.
++
++struct HostMockRoom {
++    std::mutex mu;
++    std::condition_variable cv;
++    int world = 0;
++    int arrived = 0;
++    std::vector<float*> slots;  // non-owning pointers registered per reduce
++    std::size_t count = 0;
++    int generation = 0;
++};
++
++std::mutex g_rooms_mu;
++std::unordered_map<std::string, std::shared_ptr<HostMockRoom>> g_rooms;
++
++class HostMockRankCollective final : public RankCollective {
++public:
++    HostMockRankCollective(int world, int rank, std::shared_ptr<HostMockRoom> room)
++        : world_(world), rank_(rank), room_(std::move(room)) {}
++
++    int world_size() const override { return world_; }
++    int rank() const override { return rank_; }
++    bool supports_f32() const override { return true; }
++
++    bool allreduce_f32(void* buf, std::size_t count, RankStreamHandle) override {
++        if (!buf || aborted_) return false;
++        if (count == 0) return true;
++        auto* fbuf = static_cast<float*>(buf);
++        std::unique_lock<std::mutex> lock(room_->mu);
++        if (room_->arrived == 0) {
++            room_->slots.assign(static_cast<std::size_t>(world_), nullptr);
++            room_->count = count;
++        } else if (room_->count != count) {
++            return false;
++        }
++        room_->slots[static_cast<std::size_t>(rank_)] = fbuf;
++        ++room_->arrived;
++        if (room_->arrived < world_) {
++            const int gen = room_->generation;
++            room_->cv.wait(lock, [&] {
++                return room_->generation != gen || aborted_;
++            });
++            return !aborted_;
++        }
++        // Last arriver reduces, then releases waiters.
++        for (std::size_t i = 0; i < count; ++i) {
++            double acc = 0.0;
++            for (int r = 0; r < world_; ++r) {
++                acc += room_->slots[static_cast<std::size_t>(r)][i];
++            }
++            const float v = static_cast<float>(acc);
++            for (int r = 0; r < world_; ++r) {
++                room_->slots[static_cast<std::size_t>(r)][i] = v;
++            }
++        }
++        room_->arrived = 0;
++        ++room_->generation;
++        room_->cv.notify_all();
++        return true;
++    }
++
++    bool barrier(RankStreamHandle) override {
++        // Reuse allreduce of a single zero.
++        float z = 0.f;
++        return allreduce_f32(&z, 1, 0);
++    }
++
++    bool poll_async_error(std::string* error) override {
++        if (aborted_) {
++            set_err(error, "host mock aborted");
++            return false;
++        }
++        if (error) error->clear();
++        return true;
++    }
++
++    bool abort() override {
++        aborted_ = true;
++        {
++            std::lock_guard<std::mutex> lock(room_->mu);
++            ++room_->generation;  // wake waiters
++        }
++        room_->cv.notify_all();
++        return true;
++    }
++
++private:
++    int world_ = 0;
++    int rank_ = 0;
++    std::shared_ptr<HostMockRoom> room_;
++    bool aborted_ = false;
++};
++
++#if defined(SPARKINFER_TP_NCCL)
++class NcclRankCollective final : public RankCollective {
++public:
++    static std::unique_ptr<NcclRankCollective> create(int world, int rank, int local_device,
++                                                      const NcclUniqueId& id,
++                                                      std::string* error) {
++        auto self = std::unique_ptr<NcclRankCollective>(new NcclRankCollective());
++        self->world_ = world;
++        self->rank_ = rank;
++        self->device_ = local_device;
++        if (cudaSetDevice(local_device) != cudaSuccess) {
++            set_err(error, "cudaSetDevice failed");
++            return nullptr;
++        }
++        ncclUniqueId nccl_id;
++        static_assert(sizeof(nccl_id.internal) >= kNcclUniqueIdBytes ||
++                          sizeof(ncclUniqueId) == kNcclUniqueIdBytes,
++                      "nccl unique id layout");
++        std::memcpy(&nccl_id, id.data(), kNcclUniqueIdBytes);
++        ncclResult_t r = ncclCommInitRank(&self->comm_, world, nccl_id, rank);
++        if (r != ncclSuccess) {
++            std::ostringstream os;
++            os << "ncclCommInitRank: " << ncclGetErrorString(r);
++            set_err(error, os.str());
++            return nullptr;
++        }
++        return self;
++    }
++
++    ~NcclRankCollective() override {
++        if (comm_) {
++            ncclCommDestroy(comm_);
++            comm_ = nullptr;
++        }
++    }
++
++    int world_size() const override { return world_; }
++    int rank() const override { return rank_; }
++    bool supports_f32() const override { return true; }
++
++    bool allreduce_f32(void* buf, std::size_t count, RankStreamHandle stream) override {
++        if (!comm_ || !buf) return false;
++        if (count == 0) return true;
++        auto* cuda_stream = reinterpret_cast<cudaStream_t>(stream);
++        ncclResult_t r = ncclAllReduce(buf, buf, count, ncclFloat32, ncclSum, comm_, cuda_stream);
++        if (r != ncclSuccess) {
++            std::fprintf(stderr, "[dist] ncclAllReduce f32 rank %d: %s\n", rank_,
++                         ncclGetErrorString(r));
++            return false;
++        }
++        return true;
++    }
++
++    bool allreduce_bf16(void* buf, std::size_t count, RankStreamHandle stream) override {
++        if (!comm_ || !buf) return false;
++        if (count == 0) return true;
++        auto* cuda_stream = reinterpret_cast<cudaStream_t>(stream);
++        ncclResult_t r = ncclAllReduce(buf, buf, count, ncclBfloat16, ncclSum, comm_, cuda_stream);
++        return r == ncclSuccess;
++    }
++
++    bool barrier(RankStreamHandle stream) override {
++        float* dev = nullptr;
++        if (cudaMalloc(&dev, sizeof(float)) != cudaSuccess) return false;
++        float zero = 0.f;
++        cudaMemcpy(dev, &zero, sizeof(float), cudaMemcpyHostToDevice);
++        const bool ok = allreduce_f32(dev, 1, stream);
++        cudaFree(dev);
++        return ok;
++    }
++
++    bool poll_async_error(std::string* error) override {
++        if (!comm_) {
++            set_err(error, "no communicator");
++            return false;
++        }
++        ncclResult_t async_err = ncclSuccess;
++        ncclResult_t r = ncclCommGetAsyncError(comm_, &async_err);
++        if (r != ncclSuccess) {
++            set_err(error, ncclGetErrorString(r));
++            return false;
++        }
++        if (async_err != ncclSuccess) {
++            set_err(error, ncclGetErrorString(async_err));
++            return false;
++        }
++        if (error) error->clear();
++        return true;
++    }
++
++    bool abort() override {
++        if (!comm_) return true;
++        ncclCommAbort(comm_);
++        comm_ = nullptr;
++        return true;
++    }
++
++private:
++    NcclRankCollective() = default;
++    int world_ = 0;
++    int rank_ = 0;
++    int device_ = 0;
++    ncclComm_t comm_ = nullptr;
++};
++#endif
++
++}  // namespace
++
++bool make_nccl_unique_id_bytes(NcclUniqueId* out, std::string* error) {
++    if (!out) {
++        set_err(error, "null out");
++        return false;
++    }
++#if defined(SPARKINFER_TP_NCCL)
++    ncclUniqueId id;
++    ncclResult_t r = ncclGetUniqueId(&id);
++    if (r != ncclSuccess) {
++        set_err(error, ncclGetErrorString(r));
++        return false;
++    }
++    std::memcpy(out->data(), &id, kNcclUniqueIdBytes);
++    return true;
++#else
++    for (std::size_t i = 0; i < out->size(); ++i) {
++        (*out)[i] = static_cast<std::uint8_t>(0x5A ^ i);
++    }
++    if ((*out)[0] == 0) (*out)[0] = 1;
++    return true;
++#endif
++}
++
++std::unique_ptr<RankCollective> make_host_mock_rank_collective(
++    int world_size, int rank, const std::string& session_key, std::string* error) {
++    if (world_size < 2 || rank < 0 || rank >= world_size || session_key.empty()) {
++        set_err(error, "invalid host mock collective args");
++        return nullptr;
++    }
++    std::shared_ptr<HostMockRoom> room;
++    {
++        std::lock_guard<std::mutex> lock(g_rooms_mu);
++        auto& slot = g_rooms[session_key];
++        if (!slot) {
++            slot = std::make_shared<HostMockRoom>();
++            slot->world = world_size;
++        } else if (slot->world != world_size) {
++            set_err(error, "host mock world_size mismatch for session");
++            return nullptr;
++        }
++        room = slot;
++    }
++    return std::make_unique<HostMockRankCollective>(world_size, rank, std::move(room));
++}
++
++std::unique_ptr<RankCollective> make_nccl_rank_collective(
++    int world_size, int rank, int local_device, const NcclUniqueId& id, std::string* error) {
++#if defined(SPARKINFER_TP_NCCL)
++    return NcclRankCollective::create(world_size, rank, local_device, id, error);
++#else
++    (void)world_size;
++    (void)rank;
++    (void)local_device;
++    (void)id;
++    set_err(error, "SPARKINFER_TP_NCCL not enabled at build time");
++    return nullptr;
++#endif
++}
++
++}  // namespace dist
++}  // namespace tp
++}  // namespace sparkinfer
+diff --git a/runtime/src/tp/rank_protocol.cpp b/runtime/src/tp/rank_protocol.cpp
+index ec04ddc..a68b916 100644
+--- a/runtime/src/tp/rank_protocol.cpp
++++ b/runtime/src/tp/rank_protocol.cpp
+@@ -145,28 +145,45 @@ Phase coordinator_phase(CoordinatorState state) {
+ ShardError validate_rank_spec(const RankSpec& spec, ShardDims* out) {
+     if (!out) return ShardError{"validate_rank_spec: null out"};
+     if (spec.session_id == 0) return ShardError{"session_id must be nonzero"};
+-    if (spec.world_size != kK3Tp3WorldSize)
+-        return ShardError{"this milestone requires world_size=3"};
++    if (!supported_k3_dist_world_size(spec.world_size))
++        return ShardError{"supported world_size values are 3 (TP3 width) and 4 (TP4 2-D)"};
+     if (spec.rank < 0 || spec.rank >= spec.world_size)
+-        return ShardError{"rank outside [0,3)"};
++        return ShardError{"rank outside [0, world_size)"};
+     if (spec.local_device != 0)
+         return ShardError{"one-process-per-Spark milestone requires local_device=0"};
+     if (spec.n_experts != 896)
+-        return ShardError{"this K3 TP3 plan requires exactly 896 routed experts"};
++        return ShardError{"this K3 plan requires exactly 896 routed experts"};
+     if (spec.moe_ffn != 1536)
+-        return ShardError{"this pruned K3 TP3 plan requires moe_ffn=1536"};
++        return ShardError{"this pruned K3 plan requires moe_ffn=1536"};
+     if (spec.expert_block_elems != 256)
+-        return ShardError{"this IQ1_S K3 TP3 plan requires 256-element expert blocks"};
++        return ShardError{"this IQ1_S K3 plan requires 256-element expert blocks"};
+     if (spec.vocab <= 0) return ShardError{"vocab must be > 0"};
+     if (!any_nonzero(spec.model_digest)) return ShardError{"model_digest is unset"};
+     if (!any_nonzero(spec.plan_digest)) return ShardError{"plan_digest is unset"};
+ 
+     ShardDims d;
+     d.hidden = 7168;
+-    const ShardError e = moe_all_expert_width_dims(
+-        spec.n_experts, spec.moe_ffn, spec.world_size, spec.rank,
+-        spec.expert_block_elems, &d);
+-    if (!e.ok()) return e;
++    d.tp_size = spec.world_size;
++    d.rank = spec.rank;
++    if (spec.world_size == kK3Tp3WorldSize) {
++        // 896 % 3 != 0 → keep all expert identities; split FFN width 1536→512.
++        const ShardError e = moe_all_expert_width_dims(
++            spec.n_experts, spec.moe_ffn, spec.world_size, spec.rank,
++            spec.expert_block_elems, &d);
++        if (!e.ok()) return e;
++    } else {
++        // world=4: default K3 2-D plan eg=2, fs=2 → 448 experts × 768 FFN.
++        // 896%4==0 also admits WholeExperts, but the audited memory plan and
++        // executor path for four Sparks is ExpertFfn2D.
++        const int expert_groups = k3_default_moe_expert_groups(spec.world_size);
++        const ShardError e = moe_2d_dims(
++            spec.n_experts, spec.moe_ffn, spec.world_size, spec.rank,
++            expert_groups, spec.expert_block_elems, &d);
++        if (!e.ok()) return e;
++        if (!d.moe_2d || d.moe_shard_mode != MoeShardMode::ExpertFfn2D) {
++            return ShardError{"TP4 validate expected ExpertFfn2D geometry"};
++        }
++    }
+     *out = d;
+     return ShardError{};
+ }
+diff --git a/runtime/src/tp/rank_transport_tcp.cpp b/runtime/src/tp/rank_transport_tcp.cpp
+new file mode 100644
+index 0000000..2aa97bf
+--- /dev/null
++++ b/runtime/src/tp/rank_transport_tcp.cpp
+@@ -0,0 +1,1143 @@
++// TCP framed transport for distributed K3 TP control plane.
++// Linux/POSIX sockets (DGX Spark / Ubuntu). Not built for native Win32 sockets.
++
++#include "sparkinfer/tp/rank_transport.h"
++
++#include <arpa/inet.h>
++#include <fcntl.h>
++#include <netdb.h>
++#include <netinet/in.h>
++#include <netinet/tcp.h>
++#include <poll.h>
++#include <sys/socket.h>
++#include <sys/types.h>
++#include <unistd.h>
++
++#include <cerrno>
++#include <cstring>
++#include <sstream>
++#include <utility>
++
++namespace sparkinfer {
++namespace tp {
++namespace dist {
++namespace {
++
++void set_err(std::string* error, const std::string& value) {
++    if (error) *error = value;
++}
++
++std::string errno_str(const char* what) {
++    std::ostringstream os;
++    os << what << ": " << std::strerror(errno);
++    return os.str();
++}
++
++bool set_cloexec(int fd) {
++    const int flags = fcntl(fd, F_GETFD);
++    if (flags < 0) return false;
++    return fcntl(fd, F_SETFD, flags | FD_CLOEXEC) == 0;
++}
++
++bool set_timeouts(int fd, std::chrono::milliseconds timeout, std::string* error) {
++    if (timeout.count() <= 0) return true;
++    timeval tv{};
++    tv.tv_sec = static_cast<time_t>(timeout.count() / 1000);
++    tv.tv_usec = static_cast<suseconds_t>((timeout.count() % 1000) * 1000);
++    if (setsockopt(fd, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0) {
++        set_err(error, errno_str("SO_RCVTIMEO"));
++        return false;
++    }
++    if (setsockopt(fd, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) != 0) {
++        set_err(error, errno_str("SO_SNDTIMEO"));
++        return false;
++    }
++    return true;
++}
++
++}  // namespace
++
++// ---- FramedSocket ----------------------------------------------------------
++
++FramedSocket::FramedSocket(int fd) : fd_(fd) {}
++
++FramedSocket::FramedSocket(FramedSocket&& other) noexcept : fd_(other.fd_) {
++    other.fd_ = -1;
++}
++
++FramedSocket& FramedSocket::operator=(FramedSocket&& other) noexcept {
++    if (this != &other) {
++        close();
++        fd_ = other.fd_;
++        other.fd_ = -1;
++    }
++    return *this;
++}
++
++FramedSocket::~FramedSocket() { close(); }
++
++void FramedSocket::close() {
++    if (fd_ >= 0) {
++        ::close(fd_);
++        fd_ = -1;
++    }
++}
++
++bool FramedSocket::set_recv_timeout(std::chrono::milliseconds timeout, std::string* error) {
++    if (fd_ < 0) {
++        set_err(error, "socket closed");
++        return false;
++    }
++    if (timeout.count() <= 0) return true;
++    timeval tv{};
++    tv.tv_sec = static_cast<time_t>(timeout.count() / 1000);
++    tv.tv_usec = static_cast<suseconds_t>((timeout.count() % 1000) * 1000);
++    if (setsockopt(fd_, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv)) != 0) {
++        set_err(error, errno_str("SO_RCVTIMEO"));
++        return false;
++    }
++    return true;
++}
++
++bool FramedSocket::set_send_timeout(std::chrono::milliseconds timeout, std::string* error) {
++    if (fd_ < 0) {
++        set_err(error, "socket closed");
++        return false;
++    }
++    if (timeout.count() <= 0) return true;
++    timeval tv{};
++    tv.tv_sec = static_cast<time_t>(timeout.count() / 1000);
++    tv.tv_usec = static_cast<suseconds_t>((timeout.count() % 1000) * 1000);
++    if (setsockopt(fd_, SOL_SOCKET, SO_SNDTIMEO, &tv, sizeof(tv)) != 0) {
++        set_err(error, errno_str("SO_SNDTIMEO"));
++        return false;
++    }
++    return true;
++}
++
++bool FramedSocket::send_all(const std::uint8_t* data, std::size_t n, std::string* error) {
++    std::size_t off = 0;
++    while (off < n) {
++        const ssize_t w = ::send(fd_, data + off, n - off, MSG_NOSIGNAL);
++        if (w < 0) {
++            if (errno == EINTR) continue;
++            set_err(error, errno_str("send"));
++            return false;
++        }
++        if (w == 0) {
++            set_err(error, "send returned 0");
++            return false;
++        }
++        off += static_cast<std::size_t>(w);
++    }
++    return true;
++}
++
++bool FramedSocket::recv_all(std::uint8_t* data, std::size_t n, std::string* error) {
++    std::size_t off = 0;
++    while (off < n) {
++        const ssize_t r = ::recv(fd_, data + off, n - off, 0);
++        if (r < 0) {
++            if (errno == EINTR) continue;
++            set_err(error, errno_str("recv"));
++            return false;
++        }
++        if (r == 0) {
++            set_err(error, "peer closed connection");
++            return false;
++        }
++        off += static_cast<std::size_t>(r);
++    }
++    return true;
++}
++
++bool FramedSocket::send_message(const Message& message, std::string* error) {
++    if (fd_ < 0) {
++        set_err(error, "socket closed");
++        return false;
++    }
++    std::vector<std::uint8_t> frame;
++    if (!encode_message(message, &frame, error)) return false;
++    if (frame.size() > kMaxFrameBytes) {
++        set_err(error, "encoded frame exceeds kMaxFrameBytes");
++        return false;
++    }
++    return send_all(frame.data(), frame.size(), error);
++}
++
++bool FramedSocket::recv_message(Message* message, std::string* error) {
++    if (!message) {
++        set_err(error, "null message");
++        return false;
++    }
++    if (fd_ < 0) {
++        set_err(error, "socket closed");
++        return false;
++    }
++    std::uint8_t header[kWireHeaderBytes];
++    if (!recv_all(header, sizeof(header), error)) return false;
++
++    // Little-endian payload length at bytes 8..11 of the fixed header
++    // (magic u32, version u16, type u16, payload_len u32) — must match encoder.
++    const std::uint32_t payload_len =
++        static_cast<std::uint32_t>(header[8]) |
++        (static_cast<std::uint32_t>(header[9]) << 8) |
++        (static_cast<std::uint32_t>(header[10]) << 16) |
++        (static_cast<std::uint32_t>(header[11]) << 24);
++
++    if (payload_len < kWireFixedPayloadBytes || payload_len > kMaxPayloadBytes) {
++        set_err(error, "declared payload length outside 250..506 bound");
++        return false;
++    }
++    const std::size_t total = kWireHeaderBytes + static_cast<std::size_t>(payload_len);
++    if (total > kMaxFrameBytes) {
++        set_err(error, "declared frame exceeds kMaxFrameBytes");
++        return false;
++    }
++    std::vector<std::uint8_t> frame(total);
++    std::memcpy(frame.data(), header, kWireHeaderBytes);
++    if (!recv_all(frame.data() + kWireHeaderBytes, payload_len, error)) return false;
++    return decode_message(frame.data(), frame.size(), message, error);
++}
++
++// ---- TcpListener -----------------------------------------------------------
++
++TcpListener::~TcpListener() { close(); }
++
++void TcpListener::close() {
++    if (fd_ >= 0) {
++        ::close(fd_);
++        fd_ = -1;
++    }
++    port_ = 0;
++}
++
++bool TcpListener::listen(const std::string& host, uint16_t port, std::string* error) {
++    close();
++    fd_ = ::socket(AF_INET, SOCK_STREAM, 0);
++    if (fd_ < 0) {
++        set_err(error, errno_str("socket"));
++        return false;
++    }
++    set_cloexec(fd_);
++    int one = 1;
++    setsockopt(fd_, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
++
++    sockaddr_in addr{};
++    addr.sin_family = AF_INET;
++    addr.sin_port = htons(port);
++    if (host.empty() || host == "0.0.0.0") {
++        addr.sin_addr.s_addr = htonl(INADDR_ANY);
++    } else if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
++        set_err(error, "invalid listen host (IPv4 only in this milestone)");
++        close();
++        return false;
++    }
++    if (::bind(fd_, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
++        set_err(error, errno_str("bind"));
++        close();
++        return false;
++    }
++    if (::listen(fd_, 16) != 0) {
++        set_err(error, errno_str("listen"));
++        close();
++        return false;
++    }
++    sockaddr_in bound{};
++    socklen_t blen = sizeof(bound);
++    if (getsockname(fd_, reinterpret_cast<sockaddr*>(&bound), &blen) != 0) {
++        set_err(error, errno_str("getsockname"));
++        close();
++        return false;
++    }
++    port_ = ntohs(bound.sin_port);
++    return true;
++}
++
++bool TcpListener::accept(FramedSocket* out, std::chrono::milliseconds timeout,
++                         std::string* peer_addr, std::string* error) {
++    if (!out) {
++        set_err(error, "null out");
++        return false;
++    }
++    if (fd_ < 0) {
++        set_err(error, "listener closed");
++        return false;
++    }
++    if (timeout.count() > 0) {
++        pollfd pfd{};
++        pfd.fd = fd_;
++        pfd.events = POLLIN;
++        const int pr = ::poll(&pfd, 1, static_cast<int>(timeout.count()));
++        if (pr == 0) {
++            set_err(error, "accept timeout");
++            return false;
++        }
++        if (pr < 0) {
++            set_err(error, errno_str("poll"));
++            return false;
++        }
++    }
++    sockaddr_in peer{};
++    socklen_t plen = sizeof(peer);
++    const int cfd = ::accept(fd_, reinterpret_cast<sockaddr*>(&peer), &plen);
++    if (cfd < 0) {
++        set_err(error, errno_str("accept"));
++        return false;
++    }
++    set_cloexec(cfd);
++    int one = 1;
++    setsockopt(cfd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
++    if (peer_addr) {
++        char buf[INET_ADDRSTRLEN];
++        if (inet_ntop(AF_INET, &peer.sin_addr, buf, sizeof(buf))) {
++            *peer_addr = buf;
++        } else {
++            *peer_addr = "?";
++        }
++    }
++    *out = FramedSocket(cfd);
++    return true;
++}
++
++bool tcp_connect(const std::string& host, uint16_t port,
++                 std::chrono::milliseconds timeout, FramedSocket* out,
++                 std::string* error) {
++    if (!out) {
++        set_err(error, "null out");
++        return false;
++    }
++    const int fd = ::socket(AF_INET, SOCK_STREAM, 0);
++    if (fd < 0) {
++        set_err(error, errno_str("socket"));
++        return false;
++    }
++    set_cloexec(fd);
++    int one = 1;
++    setsockopt(fd, IPPROTO_TCP, TCP_NODELAY, &one, sizeof(one));
++
++    // Non-blocking connect with poll deadline.
++    const int flags = fcntl(fd, F_GETFL, 0);
++    fcntl(fd, F_SETFL, flags | O_NONBLOCK);
++
++    sockaddr_in addr{};
++    addr.sin_family = AF_INET;
++    addr.sin_port = htons(port);
++    if (::inet_pton(AF_INET, host.c_str(), &addr.sin_addr) != 1) {
++        set_err(error, "invalid connect host (IPv4 only)");
++        ::close(fd);
++        return false;
++    }
++    const int cr = ::connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr));
++    if (cr != 0 && errno != EINPROGRESS) {
++        set_err(error, errno_str("connect"));
++        ::close(fd);
++        return false;
++    }
++    if (cr != 0) {
++        pollfd pfd{};
++        pfd.fd = fd;
++        pfd.events = POLLOUT;
++        const int pr = ::poll(&pfd, 1, static_cast<int>(timeout.count() > 0 ? timeout.count() : -1));
++        if (pr == 0) {
++            set_err(error, "connect timeout");
++            ::close(fd);
++            return false;
++        }
++        if (pr < 0) {
++            set_err(error, errno_str("poll"));
++            ::close(fd);
++            return false;
++        }
++        int soerr = 0;
++        socklen_t sl = sizeof(soerr);
++        getsockopt(fd, SOL_SOCKET, SO_ERROR, &soerr, &sl);
++        if (soerr != 0) {
++            errno = soerr;
++            set_err(error, errno_str("connect"));
++            ::close(fd);
++            return false;
++        }
++    }
++    fcntl(fd, F_SETFL, flags);  // back to blocking
++    if (!set_timeouts(fd, timeout, error)) {
++        ::close(fd);
++        return false;
++    }
++    *out = FramedSocket(fd);
++    return true;
++}
++
++// ---- CoordinatorTransport --------------------------------------------------
++
++CoordinatorTransport::CoordinatorTransport(const RankSpec& cluster, TransportConfig cfg)
++    : cluster_(cluster), cfg_(std::move(cfg)), coord_(cluster_) {
++    sockets_.resize(static_cast<std::size_t>(cluster_.world_size));
++    conn_ids_.assign(static_cast<std::size_t>(cluster_.world_size), 0);
++}
++
++CoordinatorTransport::~CoordinatorTransport() {
++    stop_ = true;
++    if (rx_thread_.joinable()) rx_thread_.join();
++    listener_.close();
++    for (auto& s : sockets_) {
++        if (s) s->close();
++    }
++}
++
++bool CoordinatorTransport::host(std::string* error) {
++    if (!listener_.listen(cfg_.host, cfg_.port, error)) return false;
++    cfg_.port = listener_.bound_port();
++    return true;
++}
++
++bool CoordinatorTransport::send_to_rank(int rank, const Message& m, std::string* error) {
++    if (rank == cluster_.rank) {
++        // Local rank 0 never receives its own TCP control frames.
++        return true;
++    }
++    if (rank < 0 || rank >= cluster_.world_size || !sockets_[static_cast<std::size_t>(rank)]) {
++        set_err(error, "send_to_rank: no socket");
++        return false;
++    }
++    return sockets_[static_cast<std::size_t>(rank)]->send_message(m, error);
++}
++
++bool CoordinatorTransport::dispatch_outbound(const std::vector<Message>& msgs,
++                                             std::string* error) {
++    for (const Message& m : msgs) {
++        // Control messages target m.rank; broadcasts use rank field per protocol.
++        if (!send_to_rank(m.rank, m, error)) return false;
++    }
++    return true;
++}
++
++bool CoordinatorTransport::handle_inbound(int rank, const Message& m, std::string* error) {
++    std::vector<Message> outbound;
++    AuthenticatedPeer peer;
++    peer.rank = rank;
++    peer.connection_id = conn_ids_[static_cast<std::size_t>(rank)];
++    if (!coord_.accept(peer, m, &outbound, error)) {
++        std::vector<Message> abort_out;
++        coord_.fail(Phase::Bootstrap, 1, error ? *error : "accept failed", &abort_out, nullptr);
++        dispatch_outbound(abort_out, nullptr);
++        return false;
++    }
++    return dispatch_outbound(outbound, error);
++}
++
++void CoordinatorTransport::rx_loop() {
++    // Simple poller over worker sockets. Production may split control thread.
++    while (!stop_) {
++        std::vector<pollfd> pfds;
++        std::vector<int> ranks;
++        {
++            std::lock_guard<std::mutex> lock(mu_);
++            for (int r = 0; r < cluster_.world_size; ++r) {
++                if (r == cluster_.rank) continue;
++                auto& s = sockets_[static_cast<std::size_t>(r)];
++                if (!s || !s->valid()) continue;
++                pollfd p{};
++                p.fd = s->fd();
++                p.events = POLLIN;
++                pfds.push_back(p);
++                ranks.push_back(r);
++            }
++        }
++        if (pfds.empty()) {
++            std::this_thread::sleep_for(std::chrono::milliseconds(5));
++            continue;
++        }
++        const int pr = ::poll(pfds.data(), pfds.size(), 50);
++        if (pr <= 0) continue;
++        for (std::size_t i = 0; i < pfds.size(); ++i) {
++            if (!(pfds[i].revents & (POLLIN | POLLHUP | POLLERR))) continue;
++            Message m;
++            std::string err;
++            bool ok = false;
++            {
++                std::lock_guard<std::mutex> lock(mu_);
++                ok = sockets_[static_cast<std::size_t>(ranks[i])]->recv_message(&m, &err);
++                if (ok) {
++                    if (!handle_inbound(ranks[i], m, &err)) {
++                        last_error_ = err;
++                        stop_ = true;
++                    }
++                } else {
++                    last_error_ = err;
++                    std::vector<Message> abort_out;
++                    coord_.fail(Phase::Step, 2, err, &abort_out, nullptr);
++                    dispatch_outbound(abort_out, nullptr);
++                    stop_ = true;
++                }
++            }
++        }
++    }
++}
++
++bool CoordinatorTransport::bootstrap(
++    const std::function<bool(NcclUniqueId*, std::string*)>& nccl_id_provider,
++    std::string* error) {
++    if (cluster_.rank != 0) {
++        set_err(error, "CoordinatorTransport requires cluster.rank==0");
++        return false;
++    }
++    // Accept world_size-1 workers.
++    const int need = cluster_.world_size - 1;
++    for (int i = 0; i < need; ++i) {
++        FramedSocket sock;
++        std::string peer;
++        if (!listener_.accept(&sock, cfg_.connect_timeout, &peer, error)) return false;
++        if (!sock.set_recv_timeout(cfg_.recv_timeout, error)) return false;
++        if (!sock.set_send_timeout(cfg_.recv_timeout, error)) return false;
++
++        // First message must be Hello; bind rank from authenticated/configured map.
++        Message hello;
++        if (!sock.recv_message(&hello, error)) return false;
++        if (hello.type != MessageType::Hello) {
++            set_err(error, "first frame must be Hello");
++            return false;
++        }
++        const int rank = hello.rank;
++        if (rank <= 0 || rank >= cluster_.world_size) {
++            set_err(error, "Hello rank out of worker range");
++            return false;
++        }
++        if (sockets_[static_cast<std::size_t>(rank)]) {
++            set_err(error, "duplicate Hello rank connection");
++            return false;
++        }
++        // Optional static token check.
++        if (rank < static_cast<int>(cfg_.peer_tokens.size()) &&
++            !cfg_.peer_tokens[static_cast<std::size_t>(rank)].empty() &&
++            cfg_.peer_tokens[static_cast<std::size_t>(rank)] != peer) {
++            set_err(error, "peer token/address mismatch for rank");
++            return false;
++        }
++        sockets_[static_cast<std::size_t>(rank)] = std::make_unique<FramedSocket>(std::move(sock));
++        conn_ids_[static_cast<std::size_t>(rank)] = static_cast<std::uint64_t>(rank) + 1000ULL;
++
++        std::vector<Message> outbound;
++        AuthenticatedPeer ap{rank, conn_ids_[static_cast<std::size_t>(rank)]};
++        if (!coord_.accept(ap, hello, &outbound, error)) return false;
++        if (!dispatch_outbound(outbound, error)) return false;
++    }
++
++    // Local rank 0 Hello into coordinator.
++    {
++        RankSession local(cluster_);
++        Message hello;
++        if (!local.hello(&hello, error)) return false;
++        std::vector<Message> outbound;
++        AuthenticatedPeer ap{0, 1};
++        conn_ids_[0] = 1;
++        if (!coord_.accept(ap, hello, &outbound, error)) return false;
++        if (!dispatch_outbound(outbound, error)) return false;
++    }
++
++    NcclUniqueId id{};
++    if (!nccl_id_provider || !nccl_id_provider(&id, error)) {
++        if (error && error->empty()) set_err(error, "nccl id provider failed");
++        return false;
++    }
++    {
++        std::vector<Message> outbound;
++        if (!coord_.install_nccl_unique_id(id, &outbound, error)) return false;
++        if (!dispatch_outbound(outbound, error)) return false;
++    }
++
++    // Rank 0 marks NCCL+load ready locally without TCP.
++    // Workers will reply over TCP; pump until Ready.
++    // Synthesize local NcclReady + LoadReady through a temporary RankSession path
++    // by feeding coordinator directly.
++    {
++        Message nccl_ready;
++        nccl_ready.type = MessageType::NcclReady;
++        nccl_ready.session_id = cluster_.session_id;
++        nccl_ready.rank = 0;
++        nccl_ready.world_size = cluster_.world_size;
++        nccl_ready.local_device = cluster_.local_device;
++        nccl_ready.n_experts = cluster_.n_experts;
++        nccl_ready.moe_ffn = cluster_.moe_ffn;
++        nccl_ready.expert_block_elems = cluster_.expert_block_elems;
++        nccl_ready.vocab = cluster_.vocab;
++        nccl_ready.model_digest = cluster_.model_digest;
++        nccl_ready.plan_digest = cluster_.plan_digest;
++        nccl_ready.phase = Phase::NcclInit;
++        nccl_ready.status = 0;
++        std::vector<Message> outbound;
++        AuthenticatedPeer ap{0, 1};
++        if (!coord_.accept(ap, nccl_ready, &outbound, error)) return false;
++        if (!dispatch_outbound(outbound, error)) return false;
++    }
++
++    // Receive worker NcclReady messages.
++    auto wait_state = [&](CoordinatorState want) -> bool {
++        const auto deadline = std::chrono::steady_clock::now() + cfg_.phase_timeout;
++        while (coord_.state() != want && coord_.good()) {
++            if (std::chrono::steady_clock::now() > deadline) {
++                set_err(error, "phase timeout waiting for workers");
++                return false;
++            }
++            // Poll each worker once.
++            for (int r = 1; r < cluster_.world_size; ++r) {
++                auto& s = sockets_[static_cast<std::size_t>(r)];
++                if (!s) continue;
++                pollfd pfd{};
++                pfd.fd = s->fd();
++                pfd.events = POLLIN;
++                if (::poll(&pfd, 1, 20) <= 0) continue;
++                Message m;
++                std::string err;
++                if (!s->recv_message(&m, &err)) {
++                    set_err(error, err);
++                    return false;
++                }
++                if (!handle_inbound(r, m, error)) return false;
++            }
++        }
++        return coord_.state() == want && coord_.good();
++    };
++
++    if (!wait_state(CoordinatorState::WaitingLoadReady) &&
++        coord_.state() != CoordinatorState::WaitingLoadReady) {
++        // After all NcclReady, state is WaitingLoadReady OR may already have BeginLoad outbound.
++        // install path: WaitingNcclReady -> after all ready, emits BeginLoad and WaitingLoadReady.
++        if (!coord_.good()) {
++            if (error && error->empty()) set_err(error, coord_.failure());
++            return false;
++        }
++    }
++    // Continue until Ready (all LoadReady).
++        {
++            const auto deadline = std::chrono::steady_clock::now() + cfg_.phase_timeout;
++            while (coord_.good() &&
++                   coord_.state() != CoordinatorState::Ready &&
++                   coord_.state() != CoordinatorState::Failed) {
++                if (std::chrono::steady_clock::now() > deadline) {
++                    set_err(error, "bootstrap phase timeout");
++                    return false;
++                }
++                for (int r = 1; r < cluster_.world_size; ++r) {
++                    auto& s = sockets_[static_cast<std::size_t>(r)];
++                    if (!s) continue;
++                    pollfd pfd{};
++                    pfd.fd = s->fd();
++                    pfd.events = POLLIN;
++                    if (::poll(&pfd, 1, 20) <= 0) continue;
++                    Message m;
++                    if (!s->recv_message(&m, error)) return false;
++                    if (!handle_inbound(r, m, error)) return false;
++                }
++                // Inject rank0 LoadReady when waiting for loads.
++                if (coord_.state() == CoordinatorState::WaitingLoadReady) {
++                    Message load_ready;
++                    load_ready.type = MessageType::LoadReady;
++                    load_ready.session_id = cluster_.session_id;
++                    load_ready.rank = 0;
++                    load_ready.world_size = cluster_.world_size;
++                    load_ready.local_device = cluster_.local_device;
++                    load_ready.n_experts = cluster_.n_experts;
++                    load_ready.moe_ffn = cluster_.moe_ffn;
++                    load_ready.expert_block_elems = cluster_.expert_block_elems;
++                    load_ready.vocab = cluster_.vocab;
++                    load_ready.model_digest = cluster_.model_digest;
++                    load_ready.plan_digest = cluster_.plan_digest;
++                    load_ready.phase = Phase::Load;
++                    load_ready.status = 0;
++                    std::vector<Message> outbound;
++                    AuthenticatedPeer ap{0, 1};
++                    std::string err;
++                    if (coord_.accept(ap, load_ready, &outbound, &err)) {
++                        if (!dispatch_outbound(outbound, error)) return false;
++                    }
++                }
++            }
++        }
++    if (coord_.state() != CoordinatorState::Ready) {
++        set_err(error, coord_.failure().empty() ? "bootstrap failed" : coord_.failure());
++        return false;
++    }
++    stop_ = false;
++    rx_thread_ = std::thread([this] { rx_loop(); });
++    return true;
++}
++
++bool CoordinatorTransport::ready() const {
++    return coord_.state() == CoordinatorState::Ready ||
++           coord_.state() == CoordinatorState::StepInFlight;
++}
++
++CoordinatorState CoordinatorTransport::state() const { return coord_.state(); }
++
++bool CoordinatorTransport::begin_step(int token_id, std::string* error) {
++    std::lock_guard<std::mutex> lock(mu_);
++    std::vector<Message> outbound;
++    if (!coord_.begin_step(token_id, &outbound, error)) return false;
++    return dispatch_outbound(outbound, error);
++}
++
++bool CoordinatorTransport::finish(std::string* error) {
++    std::lock_guard<std::mutex> lock(mu_);
++    std::vector<Message> outbound;
++    if (!coord_.finish(&outbound, error)) return false;
++    if (!dispatch_outbound(outbound, error)) return false;
++    // Wait finish acks via rx thread + pump.
++    const auto deadline = std::chrono::steady_clock::now() + cfg_.phase_timeout;
++    while (coord_.state() != CoordinatorState::Finished && coord_.good()) {
++        if (std::chrono::steady_clock::now() > deadline) {
++            set_err(error, "finish timeout");
++            return false;
++        }
++        // Rank-0 FinishAck is injected by the full distributed runtime once it
++        // owns a local RankSession; this transport milestone relies on workers
++        // plus the rx thread for remote acks.
++        std::this_thread::sleep_for(std::chrono::milliseconds(5));
++        if (!last_error_.empty()) {
++            set_err(error, last_error_);
++            return false;
++        }
++    }
++    stop_ = true;
++    return coord_.state() == CoordinatorState::Finished;
++}
++
++bool CoordinatorTransport::fail(const std::string& detail, std::string* error) {
++    std::lock_guard<std::mutex> lock(mu_);
++    std::vector<Message> outbound;
++    if (!coord_.fail(Phase::Step, 1, detail, &outbound, error)) return false;
++    return dispatch_outbound(outbound, error);
++}
++
++bool CoordinatorTransport::pump(std::chrono::milliseconds budget, std::string* error) {
++    const auto deadline = std::chrono::steady_clock::now() + budget;
++    while (std::chrono::steady_clock::now() < deadline) {
++        if (!last_error_.empty()) {
++            set_err(error, last_error_);
++            return false;
++        }
++        if (coord_.state() == CoordinatorState::Ready ||
++            coord_.state() == CoordinatorState::Finished) {
++            return true;
++        }
++        std::this_thread::sleep_for(std::chrono::milliseconds(2));
++    }
++    return true;
++}
++
++// ---- RankTransport ---------------------------------------------------------
++
++RankTransport::RankTransport(const RankSpec& spec, TransportConfig cfg)
++    : spec_(spec), cfg_(std::move(cfg)), session_(spec_) {}
++
++RankTransport::~RankTransport() { sock_.close(); }
++
++bool RankTransport::send(const Message& m, std::string* error) {
++    return sock_.send_message(m, error);
++}
++
++bool RankTransport::recv(Message* m, std::string* error) {
++    return sock_.recv_message(m, error);
++}
++
++bool RankTransport::bootstrap(
++    const std::function<bool(const NcclUniqueId&, std::string*)>& on_nccl_init,
++    const std::function<bool(std::string*)>& on_load,
++    std::string* error) {
++    if (!tcp_connect(cfg_.host, cfg_.port, cfg_.connect_timeout, &sock_, error)) return false;
++    if (!sock_.set_recv_timeout(cfg_.recv_timeout, error)) return false;
++    if (!sock_.set_send_timeout(cfg_.recv_timeout, error)) return false;
++
++    Message hello;
++    if (!session_.hello(&hello, error)) return false;
++    if (!send(hello, error)) return false;
++
++    // NcclUniqueId
++    Message m;
++    if (!recv(&m, error)) return false;
++    if (!session_.accept_control(m, nullptr, error)) return false;
++    if (session_.state() != RankState::NeedNcclInit) {
++        set_err(error, "expected NeedNcclInit after unique id");
++        return false;
++    }
++    if (on_nccl_init) {
++        if (!on_nccl_init(session_.nccl_unique_id(), error)) {
++            Message out;
++            session_.report_nccl_ready(false, 1, error ? *error : "nccl init failed", &out, nullptr);
++            send(out, nullptr);
++            return false;
++        }
++    }
++    {
++        Message out;
++        if (!session_.report_nccl_ready(true, 0, "", &out, error)) return false;
++        if (!send(out, error)) return false;
++    }
++
++    // BeginLoad
++    if (!recv(&m, error)) return false;
++    if (!session_.accept_control(m, nullptr, error)) return false;
++    if (on_load) {
++        if (!on_load(error)) {
++            Message out;
++            session_.report_load_ready(false, 1, error ? *error : "load failed", &out, nullptr);
++            send(out, nullptr);
++            return false;
++        }
++    }
++    {
++        Message out;
++        if (!session_.report_load_ready(true, 0, "", &out, error)) return false;
++        if (!send(out, error)) return false;
++    }
++    return session_.state() == RankState::WaitingToken;
++}
++
++bool RankTransport::wait_token(int* token_id, std::string* error) {
++    Message m;
++    if (!recv(&m, error)) return false;
++    int tok = -1;
++    if (!session_.accept_control(m, &tok, error)) return false;
++    if (m.type == MessageType::Finish || m.type == MessageType::Abort) {
++        return false;
++    }
++    if (token_id) *token_id = tok;
++    return session_.state() == RankState::StepRunning;
++}
++
++bool RankTransport::report_step_done(bool success, int status, const std::string& detail,
++                                     std::string* error) {
++    Message out;
++    if (!session_.report_step_done(success, status, detail, &out, error)) return false;
++    return send(out, error);
++}
++
++bool RankTransport::wait_finished(std::string* error) {
++    // Drain until Finish/Abort then ack.
++    while (session_.good() && session_.state() != RankState::Finished &&
++           session_.state() != RankState::Failed) {
++        Message m;
++        if (!recv(&m, error)) return false;
++        int tok = -1;
++        if (!session_.accept_control(m, &tok, error)) {
++            if (session_.state() == RankState::Failed) return false;
++        }
++        if (session_.state() == RankState::FinishPending) {
++            Message out;
++            if (!session_.report_finish_ack(&out, error)) return false;
++            if (!send(out, error)) return false;
++            return session_.state() == RankState::Finished;
++        }
++        if (session_.state() == RankState::StepRunning) {
++            // Unexpected token while waiting finish — complete it.
++            Message out;
++            session_.report_step_done(true, 0, "", &out, nullptr);
++            send(out, nullptr);
++        }
++        if (m.type == MessageType::Abort) return false;
++    }
++    return session_.state() == RankState::Finished;
++}
++
++RankState RankTransport::state() const { return session_.state(); }
++bool RankTransport::good() const { return session_.good(); }
++
++// ---- Dry run ---------------------------------------------------------------
++
++std::string plan_identity_string(int world_size) {
++    std::ostringstream os;
++    os << "sparkinfer-k3-dist-v1 world=" << world_size
++       << " experts=896 moe_ffn=1536 block=256 WEPS=0";
++    if (world_size == 3) {
++        os << " mode=AllExpertsFfnWidth bands=512/512/512 gate_up=ne1 down=ne0";
++    } else if (world_size == 4) {
++        os << " mode=ExpertFfn2D eg=2 fs=2 experts_per_group=448 ffn_per_shard=768";
++    } else {
++        os << " mode=unsupported";
++    }
++    return os.str();
++}
++
++static Digest digest_from_string(const std::string& s) {
++    Digest d{};
++    for (std::size_t i = 0; i < s.size(); ++i) {
++        d[i % d.size()] ^= static_cast<std::uint8_t>(s[i]);
++        d[(i + 7) % d.size()] =
++            static_cast<std::uint8_t>(d[(i + 7) % d.size()] * 33u + static_cast<unsigned>(s[i]));
++    }
++    if (d[0] == 0) d[0] = 1;
++    return d;
++}
++
++static RankSpec make_spec(const LocalhostDryRunConfig& cfg, int rank) {
++    RankSpec s;
++    s.session_id = cfg.session_id;
++    s.world_size = cfg.world_size;
++    s.rank = rank;
++    s.local_device = 0;
++    s.n_experts = 896;
++    s.moe_ffn = 1536;
++    s.expert_block_elems = 256;
++    s.vocab = cfg.vocab;
++    s.model_digest = cfg.model_digest;
++    s.plan_digest = cfg.plan_digest;
++    if (s.model_digest[0] == 0 && s.model_digest[1] == 0)
++        s.model_digest = digest_from_string("model-test");
++    if (s.plan_digest[0] == 0 && s.plan_digest[1] == 0)
++        s.plan_digest = digest_from_string(plan_identity_string(cfg.world_size));
++    return s;
++}
++
++static AuthenticatedPeer peer_of(int rank) {
++    AuthenticatedPeer p;
++    p.rank = rank;
++    p.connection_id = 0xC0ffee00ULL + static_cast<std::uint64_t>(rank);
++    return p;
++}
++
++// In-process multi-rank protocol dry-run (no sockets). Exercises the same
++// Coordinator/RankSession machines the TCP adapter drives, for world 3 and 4.
++LocalhostDryRunResult run_localhost_protocol_dry_run(const LocalhostDryRunConfig& cfg) {
++    LocalhostDryRunResult result;
++    if (!supported_k3_dist_world_size(cfg.world_size)) {
++        result.error = "world_size must be 3 or 4";
++        return result;
++    }
++
++    const RankSpec cluster = make_spec(cfg, 0);
++    for (int r = 0; r < cfg.world_size; ++r) {
++        ShardDims dims;
++        const ShardError e = validate_rank_spec(make_spec(cfg, r), &dims);
++        if (!e.ok()) {
++            result.error = e.message;
++            return result;
++        }
++        if (cfg.world_size == 3) {
++            if (dims.moe_shard_mode != MoeShardMode::AllExpertsFfnWidth ||
++                dims.n_experts != 896 || dims.moe_ffn != 512) {
++                result.error = "TP3 geometry mismatch";
++                return result;
++            }
++            const int want_off = r * 512;
++            if (dims.moe_ffn_band.offset != want_off || dims.moe_ffn_band.extent != 512) {
++                result.error = "TP3 FFN band mismatch";
++                return result;
++            }
++        } else {
++            if (dims.moe_shard_mode != MoeShardMode::ExpertFfn2D ||
++                dims.moe_expert_groups != 2 || dims.moe_ffn_shards != 2 ||
++                dims.n_experts != 448 || dims.moe_ffn != 768) {
++                result.error = "TP4 geometry mismatch";
++                return result;
++            }
++        }
++    }
++
++    Coordinator coordinator(cluster);
++    std::vector<RankSession> ranks;
++    ranks.reserve(static_cast<std::size_t>(cfg.world_size));
++    for (int r = 0; r < cfg.world_size; ++r) ranks.emplace_back(make_spec(cfg, r));
++
++    auto wire = [](const Message& in, Message* out, std::string* err) -> bool {
++        std::vector<std::uint8_t> bytes;
++        if (!encode_message(in, &bytes, err)) return false;
++        return decode_message(bytes.data(), bytes.size(), out, err);
++    };
++
++    std::string error;
++    std::vector<Message> out;
++
++    // Hello
++    for (int r = 0; r < cfg.world_size; ++r) {
++        Message hello;
++        if (!ranks[static_cast<std::size_t>(r)].hello(&hello, &error)) {
++            result.error = error;
++            return result;
++        }
++        Message m;
++        if (!wire(hello, &m, &error)) {
++            result.error = error;
++            return result;
++        }
++        if (!coordinator.accept(peer_of(r), m, &out, &error)) {
++            result.error = error;
++            return result;
++        }
++    }
++    if (coordinator.state() != CoordinatorState::AwaitingNcclUniqueId) {
++        result.error = "expected AwaitingNcclUniqueId";
++        return result;
++    }
++
++    NcclUniqueId id{};
++    for (std::size_t i = 0; i < id.size(); ++i)
++        id[i] = static_cast<std::uint8_t>(0xA0 + i);
++    out.clear();
++    if (!coordinator.install_nccl_unique_id(id, &out, &error)) {
++        result.error = error;
++        return result;
++    }
++    for (const Message& control : out) {
++        Message m;
++        if (!wire(control, &m, &error)) {
++            result.error = error;
++            return result;
++        }
++        if (!ranks[static_cast<std::size_t>(m.rank)].accept_control(m, nullptr, &error)) {
++            result.error = error;
++            return result;
++        }
++    }
++
++    out.clear();
++    for (int r = 0; r < cfg.world_size; ++r) {
++        Message ready;
++        if (!ranks[static_cast<std::size_t>(r)].report_nccl_ready(true, 0, "", &ready, &error)) {
++            result.error = error;
++            return result;
++        }
++        Message m;
++        if (!wire(ready, &m, &error)) {
++            result.error = error;
++            return result;
++        }
++        if (!coordinator.accept(peer_of(r), m, &out, &error)) {
++            result.error = error;
++            return result;
++        }
++    }
++    // Deliver BeginLoad
++    for (const Message& control : out) {
++        Message m;
++        if (!wire(control, &m, &error)) {
++            result.error = error;
++            return result;
++        }
++        if (!ranks[static_cast<std::size_t>(m.rank)].accept_control(m, nullptr, &error)) {
++            result.error = error;
++            return result;
++        }
++    }
++
++    out.clear();
++    for (int r = 0; r < cfg.world_size; ++r) {
++        Message ready;
++        if (!ranks[static_cast<std::size_t>(r)].report_load_ready(true, 0, "", &ready, &error)) {
++            result.error = error;
++            return result;
++        }
++        Message m;
++        if (!wire(ready, &m, &error)) {
++            result.error = error;
++            return result;
++        }
++        if (!coordinator.accept(peer_of(r), m, &out, &error)) {
++            result.error = error;
++            return result;
++        }
++    }
++    if (coordinator.state() != CoordinatorState::Ready) {
++        result.error = "expected Ready after LoadReady";
++        return result;
++    }
++
++    result.tokens_seen_per_rank.assign(static_cast<std::size_t>(cfg.world_size), {});
++    for (int tok : cfg.tokens) {
++        out.clear();
++        if (!coordinator.begin_step(tok, &out, &error)) {
++            result.error = error;
++            return result;
++        }
++        // Deliver Token to every rank
++        for (const Message& control : out) {
++            Message m;
++            if (!wire(control, &m, &error)) {
++                result.error = error;
++                return result;
++            }
++            int got = -1;
++            if (!ranks[static_cast<std::size_t>(m.rank)].accept_control(m, &got, &error)) {
++                result.error = error;
++                return result;
++            }
++            if (got != tok) {
++                result.error = "token mismatch at rank";
++                return result;
++            }
++            result.tokens_seen_per_rank[static_cast<std::size_t>(m.rank)].push_back(got);
++        }
++        out.clear();
++        for (int r = 0; r < cfg.world_size; ++r) {
++            Message done;
++            if (!ranks[static_cast<std::size_t>(r)].report_step_done(true, 0, "", &done, &error)) {
++                result.error = error;
++                return result;
++            }
++            Message m;
++            if (!wire(done, &m, &error)) {
++                result.error = error;
++                return result;
++            }
++            if (!coordinator.accept(peer_of(r), m, &out, &error)) {
++                result.error = error;
++                return result;
++            }
++        }
++        if (coordinator.state() != CoordinatorState::Ready) {
++            result.error = "expected Ready after StepDone";
++            return result;
++        }
++    }
++
++    out.clear();
++    if (!coordinator.finish(&out, &error)) {
++        result.error = error;
++        return result;
++    }
++    for (const Message& control : out) {
++        Message m;
++        if (!wire(control, &m, &error)) {
++            result.error = error;
++            return result;
++        }
++        if (!ranks[static_cast<std::size_t>(m.rank)].accept_control(m, nullptr, &error)) {
++            result.error = error;
++            return result;
++        }
++    }
++    out.clear();
++    for (int r = 0; r < cfg.world_size; ++r) {
++        Message ack;
++        if (!ranks[static_cast<std::size_t>(r)].report_finish_ack(&ack, &error)) {
++            result.error = error;
++            return result;
++        }
++        Message m;
++        if (!wire(ack, &m, &error)) {
++            result.error = error;
++            return result;
++        }
++        if (!coordinator.accept(peer_of(r), m, &out, &error)) {
++            result.error = error;
++            return result;
++        }
++    }
++    if (coordinator.state() != CoordinatorState::Finished) {
++        result.error = "expected Finished";
++        return result;
++    }
++
++    for (int r = 0; r < cfg.world_size; ++r) {
++        if (result.tokens_seen_per_rank[static_cast<std::size_t>(r)] != cfg.tokens) {
++            result.error = "token sequence mismatch";
++            return result;
++        }
++    }
++    result.final_coord_state = coordinator.state();
++    result.ok = true;
++    return result;
++}
++
++}  // namespace dist
++}  // namespace tp
++}  // namespace sparkinfer
+diff --git a/runtime/tests/CMakeLists.txt b/runtime/tests/CMakeLists.txt
+index cdfd9e9..a192b21 100644
+--- a/runtime/tests/CMakeLists.txt
++++ b/runtime/tests/CMakeLists.txt
+@@ -99,7 +99,7 @@ set_target_properties(tp3_all_expert_width_cpu_test PROPERTIES CXX_STANDARD 17)
+ target_include_directories(tp3_all_expert_width_cpu_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+ add_test(NAME tp3_all_expert_width_cpu_test COMMAND tp3_all_expert_width_cpu_test)
+ 
+-# Distributed three-Spark control plane: portable wire framing and state machines
++# Distributed three/four-Spark control plane: portable wire framing and state machines
+ # only. No socket, CUDA, or NCCL implementation is linked by this test.
+ add_executable(tp3_rank_protocol_cpu_test tp3_rank_protocol_cpu_test.cpp
+                ../src/tp/rank_protocol.cpp ../src/tp/weight_plan.cpp
+@@ -107,6 +107,17 @@ add_executable(tp3_rank_protocol_cpu_test tp3_rank_protocol_cpu_test.cpp
+ set_target_properties(tp3_rank_protocol_cpu_test PROPERTIES CXX_STANDARD 17)
+ add_test(NAME tp3_rank_protocol_cpu_test COMMAND tp3_rank_protocol_cpu_test)
+ 
++# TCP framing + TP3/TP4 dry-run + host-mock rank collective (POSIX sockets; no CUDA).
++add_executable(tp_dist_rank_cpu_test tp_dist_rank_cpu_test.cpp
++               ../src/tp/rank_protocol.cpp
++               ../src/tp/rank_transport_tcp.cpp
++               ../src/tp/rank_collective.cpp
++               ../src/tp/weight_plan.cpp
++               ../src/tp/shard.cpp)
++set_target_properties(tp_dist_rank_cpu_test PROPERTIES CXX_STANDARD 17)
++target_link_libraries(tp_dist_rank_cpu_test PRIVATE Threads::Threads)
++add_test(NAME tp_dist_rank_cpu_test COMMAND tp_dist_rank_cpu_test)
++
+ # The K3 decode schedule: op order, widths, and collective placement as DATA, so the
+ # properties that would otherwise only show up as degraded output are assertable
+ # without a GPU. Strongest check inside is the plan/manifest cross-check — two tensor
+diff --git a/runtime/tests/tp3_rank_protocol_cpu_test.cpp b/runtime/tests/tp3_rank_protocol_cpu_test.cpp
+index 9cc05e2..cbc1a20 100644
+--- a/runtime/tests/tp3_rank_protocol_cpu_test.cpp
++++ b/runtime/tests/tp3_rank_protocol_cpu_test.cpp
+@@ -291,8 +291,18 @@ static void test_spec_and_bootstrap_refusals() {
+     std::printf("spec_and_bootstrap_refusals\n");
+     RankSpec bad = spec_for(0);
+     ShardDims d;
+-    bad.world_size = 4;
+-    CHECK(!validate_rank_spec(bad, &d).ok(), "world_size != 3 must fail");
++    bad.world_size = 5;
++    CHECK(!validate_rank_spec(bad, &d).ok(), "unsupported world_size must fail");
++    // world=4 is supported (ExpertFfn2D); world=3 remains the width path.
++    {
++        RankSpec tp4 = spec_for(0);
++        tp4.world_size = 4;
++        CHECK(validate_rank_spec(tp4, &d).ok(), "world_size=4 must validate");
++        CHECK_EQ(d.moe_expert_groups, 2);
++        CHECK_EQ(d.moe_ffn_shards, 2);
++        CHECK_EQ(d.n_experts, 448);
++        CHECK_EQ(d.moe_ffn, 768);
++    }
+     bad = spec_for(0); bad.local_device = 1;
+     CHECK(!validate_rank_spec(bad, &d).ok(), "local device != 0 must fail");
+     bad = spec_for(0); bad.n_experts = 895;
+diff --git a/runtime/tests/tp_dist_rank_cpu_test.cpp b/runtime/tests/tp_dist_rank_cpu_test.cpp
+new file mode 100644
+index 0000000..c3e7325
+--- /dev/null
++++ b/runtime/tests/tp_dist_rank_cpu_test.cpp
+@@ -0,0 +1,211 @@
++// CPU tests: TP3/TP4 plan validation, in-process multi-rank protocol dry-run,
++// host-mock rank collective, and TCP framed socket round-trip.
++
++#include "sparkinfer/tp/rank_collective.h"
++#include "sparkinfer/tp/rank_protocol.h"
++#include "sparkinfer/tp/rank_transport.h"
++
++#include <atomic>
++#include <cstdio>
++#include <cstring>
++#include <string>
++#include <sys/socket.h>
++#include <thread>
++#include <vector>
++
++using namespace sparkinfer::tp;
++using namespace sparkinfer::tp::dist;
++
++static int g_checks = 0;
++static int g_failures = 0;
++
++#define CHECK(cond, ...)                                                          \
++    do {                                                                          \
++        ++g_checks;                                                               \
++        if (!(cond)) {                                                            \
++            ++g_failures;                                                          \
++            std::printf("FAIL %s:%d: ", __FILE__, __LINE__);                       \
++            std::printf(__VA_ARGS__);                                             \
++            std::printf("\n");                                                    \
++        }                                                                         \
++    } while (0)
++
++#define CHECK_EQ(a, b) CHECK((long long)(a) == (long long)(b),                    \
++                             "got %lld want %lld",                                \
++                             (long long)(a), (long long)(b))
++
++static void test_tp3_geometry() {
++    LocalhostDryRunConfig cfg;
++    cfg.world_size = 3;
++    cfg.tokens = {7, 8, 9};
++    auto r = run_localhost_protocol_dry_run(cfg);
++    CHECK(r.ok, "TP3 dry-run failed: %s", r.error.c_str());
++    CHECK_EQ(static_cast<int>(r.final_coord_state), static_cast<int>(CoordinatorState::Finished));
++}
++
++static void test_tp4_geometry() {
++    LocalhostDryRunConfig cfg;
++    cfg.world_size = 4;
++    cfg.tokens = {11, 12};
++    auto r = run_localhost_protocol_dry_run(cfg);
++    CHECK(r.ok, "TP4 dry-run failed: %s", r.error.c_str());
++    CHECK_EQ(static_cast<int>(r.final_coord_state), static_cast<int>(CoordinatorState::Finished));
++}
++
++static void test_reject_world_5() {
++    RankSpec s;
++    s.session_id = 1;
++    s.world_size = 5;
++    s.rank = 0;
++    s.vocab = 163840;
++    s.model_digest[0] = 1;
++    s.plan_digest[0] = 2;
++    ShardDims d;
++    const ShardError e = validate_rank_spec(s, &d);
++    CHECK(!e.ok(), "world 5 should be rejected");
++}
++
++static void test_host_mock_allreduce_tp3() {
++    const std::string key = "mock-tp3-ar";
++    std::vector<std::thread> threads;
++    std::atomic<int> ok{0};
++    for (int r = 0; r < 3; ++r) {
++        threads.emplace_back([&, r] {
++            std::string err;
++            auto coll = make_host_mock_rank_collective(3, r, key, &err);
++            if (!coll) return;
++            float v = static_cast<float>(r + 1);  // 1,2,3
++            if (!coll->allreduce_f32(&v, 1, 0)) return;
++            if (v == 6.f) ok.fetch_add(1);
++        });
++    }
++    for (auto& t : threads) t.join();
++    CHECK_EQ(ok.load(), 3);
++}
++
++static void test_host_mock_allreduce_tp4() {
++    const std::string key = "mock-tp4-ar";
++    std::vector<std::thread> threads;
++    std::atomic<int> ok{0};
++    for (int r = 0; r < 4; ++r) {
++        threads.emplace_back([&, r] {
++            std::string err;
++            auto coll = make_host_mock_rank_collective(4, r, key, &err);
++            if (!coll) return;
++            float buf[2] = {1.f, static_cast<float>(r)};
++            if (!coll->allreduce_f32(buf, 2, 0)) return;
++            if (buf[0] == 4.f && buf[1] == 6.f) ok.fetch_add(1);  // 0+1+2+3=6
++        });
++    }
++    for (auto& t : threads) t.join();
++    CHECK_EQ(ok.load(), 4);
++}
++
++static void test_tcp_framed_roundtrip() {
++    std::string err;
++    TcpListener listener;
++    CHECK(listener.listen("127.0.0.1", 0, &err), "listen failed: %s", err.c_str());
++    const uint16_t port = listener.bound_port();
++    CHECK(port != 0, "ephemeral port");
++
++    Message sent;
++    sent.type = MessageType::Token;
++    sent.session_id = 0xdeadbeefULL;
++    sent.sequence = 42;
++    sent.rank = 1;
++    sent.world_size = 3;
++    sent.local_device = 0;
++    sent.n_experts = 896;
++    sent.moe_ffn = 1536;
++    sent.expert_block_elems = 256;
++    sent.vocab = 163840;
++    sent.token_id = 17374;
++    sent.phase = Phase::Step;
++    sent.model_digest[0] = 9;
++    sent.plan_digest[0] = 8;
++    sent.detail = "tcp-roundtrip";
++
++    Message received;
++    std::atomic<bool> server_ok{false};
++    std::string server_err;
++    std::thread server([&] {
++        FramedSocket sock;
++        std::string peer;
++        if (!listener.accept(&sock, std::chrono::milliseconds(2000), &peer, &server_err)) return;
++        if (!sock.recv_message(&received, &server_err)) return;
++        // Echo FinishAck-shaped reply
++        Message reply = received;
++        reply.type = MessageType::StepDone;
++        reply.token_id = -1;
++        if (!sock.send_message(reply, &server_err)) return;
++        server_ok = true;
++    });
++
++    FramedSocket client;
++    CHECK(tcp_connect("127.0.0.1", port, std::chrono::milliseconds(2000), &client, &err),
++          "connect failed: %s", err.c_str());
++    CHECK(client.send_message(sent, &err), "send failed: %s", err.c_str());
++    Message echo;
++    CHECK(client.recv_message(&echo, &err), "recv failed: %s", err.c_str());
++    server.join();
++    CHECK(server_ok.load(), "server side failed: %s", server_err.c_str());
++    CHECK_EQ(received.token_id, 17374);
++    CHECK_EQ(received.sequence, 42);
++    CHECK(received.detail == "tcp-roundtrip", "detail mismatch");
++    CHECK(echo.type == MessageType::StepDone, "echo type");
++}
++
++static void test_tcp_rejects_oversize_payload_declaration() {
++    // Craft a bad header with payload_len = 600 (>506) and ensure recv fails
++    // before reading a body.
++    std::string err;
++    TcpListener listener;
++    CHECK(listener.listen("127.0.0.1", 0, &err), "listen: %s", err.c_str());
++    const uint16_t port = listener.bound_port();
++
++    std::atomic<bool> rejected{false};
++    std::thread server([&] {
++        FramedSocket sock;
++        std::string peer, e2;
++        if (!listener.accept(&sock, std::chrono::milliseconds(2000), &peer, &e2)) return;
++        Message m;
++        if (!sock.recv_message(&m, &e2)) {
++            if (e2.find("250..506") != std::string::npos ||
++                e2.find("outside") != std::string::npos) {
++                rejected = true;
++            }
++        }
++    });
++
++    FramedSocket client;
++    CHECK(tcp_connect("127.0.0.1", port, std::chrono::milliseconds(2000), &client, &err),
++          "connect: %s", err.c_str());
++    // Build illegal 16-byte header: magic K3RP, ver=1, type=Token, payload=600, crc=0
++    std::uint8_t hdr[16] = {};
++    hdr[0] = 'K'; hdr[1] = '3'; hdr[2] = 'R'; hdr[3] = 'P';
++    hdr[4] = 1; hdr[5] = 0;  // version
++    hdr[6] = 6; hdr[7] = 0;  // Token
++    const std::uint32_t bad_len = 600;
++    std::memcpy(hdr + 8, &bad_len, 4);
++    // send raw
++    const int fd = client.fd();
++    CHECK(fd >= 0, "fd");
++    // Use send via a small helper — FramedSocket doesn't expose raw send; use ::send
++    ssize_t w = ::send(fd, hdr, sizeof(hdr), 0);
++    CHECK(w == 16, "raw header send");
++    server.join();
++    CHECK(rejected.load(), "oversize payload must be rejected before body alloc");
++}
++
++int main() {
++    test_tp3_geometry();
++    test_tp4_geometry();
++    test_reject_world_5();
++    test_host_mock_allreduce_tp3();
++    test_host_mock_allreduce_tp4();
++    test_tcp_framed_roundtrip();
++    test_tcp_rejects_oversize_payload_declaration();
++
++    std::printf("tp_dist_rank_cpu_test: %d checks, %d failures\n", g_checks, g_failures);
++    return g_failures ? 1 : 0;
++}
+-- 
+2.43.0
+

@@ -1,0 +1,556 @@
+From f271b01800251015f5b8188d4743bc0f2c03b9ea Mon Sep 17 00:00:00 2001
+From: Hermes <hermes@local>
+Date: Fri, 7 Aug 2026 10:51:23 -0700
+Subject: [PATCH 06/12] tp: rank-local GGUF load API + MoE residency budget
+ (Phase 2)
+
+---
+ .../sparkinfer/models/kimi_k3_dist_rank.h     |  48 +++++
+ .../include/sparkinfer/tp/rank_local_loader.h |  45 +++++
+ runtime/src/models/kimi_k3_dist_rank.cpp      | 182 ++++++++++++++++++
+ runtime/src/tp/rank_local_loader.cpp          |  79 ++++++++
+ runtime/tests/CMakeLists.txt                  |  24 +++
+ .../tests/tp_rank_local_loader_cpu_test.cpp   | 117 +++++++++++
+ 6 files changed, 495 insertions(+)
+ create mode 100755 runtime/include/sparkinfer/models/kimi_k3_dist_rank.h
+ create mode 100755 runtime/include/sparkinfer/tp/rank_local_loader.h
+ create mode 100755 runtime/src/models/kimi_k3_dist_rank.cpp
+ create mode 100755 runtime/src/tp/rank_local_loader.cpp
+ create mode 100755 runtime/tests/tp_rank_local_loader_cpu_test.cpp
+
+diff --git a/runtime/include/sparkinfer/models/kimi_k3_dist_rank.h b/runtime/include/sparkinfer/models/kimi_k3_dist_rank.h
+new file mode 100755
+index 0000000..6f3a62c
+--- /dev/null
++++ b/runtime/include/sparkinfer/models/kimi_k3_dist_rank.h
+@@ -0,0 +1,48 @@
++#pragma once
++// One distributed TP rank on one host: open GGUF, load this rank's slices, alloc state.
++
++#include "sparkinfer/models/kimi_k3.h"
++#include "sparkinfer/models/kimi_k3_config.h"
++#include "sparkinfer/tp/rank_local_plan.h"
++#include "sparkinfer/tp/rank_local_loader.h"
++
++#include <cuda_runtime.h>
++#include <string>
++
++namespace sparkinfer {
++
++struct KimiK3DistRank {
++    tp::dist::RankLocalPlan plan;
++    tp::dist::RankLocalBudget budget;
++    KimiK3Config cfg;
++    K3PlanOptions opt;
++    KimiK3Weights weights;
++    KimiK3RuntimeState state;
++    KimiK3Forward fwd;
++    float* x = nullptr;
++    float* x_next = nullptr;
++    cudaStream_t stream = nullptr;
++    int device = 0;
++    bool loaded = false;
++};
++
++struct KimiK3DistRankLoadOptions {
++    int max_ctx = 8192;
++    // ExpertsAndAttn: shard MoE + KDA + MLA like same-host TP default.
++    KimiK3Weights::ShardPolicy policy = KimiK3Weights::ShardPolicy::ExpertsAndAttn;
++    bool verbose = true;
++    // Embed is loaded on all ranks (replicated) for the first correctness milestone.
++    bool load_embed_all_ranks = true;
++};
++
++// gguf_first_shard: path to …-00001-of-00009.gguf
++// Returns false and fills error on failure. Does not init NCCL.
++bool kimi_k3_dist_rank_load(const std::string& gguf_first_shard,
++                            const tp::dist::RankSpec& spec,
++                            const KimiK3DistRankLoadOptions& opt,
++                            KimiK3DistRank* out,
++                            std::string* error = nullptr);
++
++void kimi_k3_dist_rank_free(KimiK3DistRank* r);
++
++}  // namespace sparkinfer
+diff --git a/runtime/include/sparkinfer/tp/rank_local_loader.h b/runtime/include/sparkinfer/tp/rank_local_loader.h
+new file mode 100755
+index 0000000..9549ee3
+--- /dev/null
++++ b/runtime/include/sparkinfer/tp/rank_local_loader.h
+@@ -0,0 +1,45 @@
++#pragma once
++// Rank-local GGUF load for one process per Spark (distributed TP3/TP4).
++//
++// Builds on existing upload_sliced + ShardDims: when tp_size>1 and
++// AllExpertsFfnWidth is set, expert gate/up/down load only this rank's FFN band.
++// Rank 0 loads the full LM head; workers skip it (first correctness milestone).
++//
++// CUDA is required for the actual load. CPU-only helpers plan residency budgets
++// without a device so CI can prove ~1/3 expert bytes per TP3 rank.
++
++#include "sparkinfer/tp/rank_local_plan.h"
++#include "sparkinfer/tp/weight_residency.h"
++
++#include <cstddef>
++#include <string>
++#include <vector>
++
++namespace sparkinfer {
++namespace tp {
++namespace dist {
++
++// CPU: build synthetic K3-Neuron expert stack descriptors (92 MoE layers x 3 tensors)
++// and plan residency for one rank. Used by tests and pre-load receipts.
++struct RankLocalBudget {
++    RankLocalPlan plan;
++    ResidencyReport moe_report;   // routed expert stacks only
++    std::size_t estimated_moe_rank_bytes = 0;
++    std::size_t estimated_moe_model_bytes = 0;
++    double moe_rank_frac = 0.0;   // rank/model for MoE stacks
++    std::string receipt;
++};
++
++// iq1_s_type defaults to ggml type 19 (IQ1_S).
++ShardError plan_rank_local_moe_budget(const RankSpec& spec, RankLocalBudget* out,
++                                      int iq1_s_type = 19);
++
++// Tensor descs for one MoE layer's routed experts under pruned width 1536.
++// ne order: gate/up [hidden=3584, ffn=1536, n_experts], down [ffn, hidden, n_experts]
++// Matching K3 GGUF conventions used by weight_plan (suffix match).
++std::vector<TensorDesc> k3_neuron_moe_layer_descs(int layer, int n_experts, int moe_ffn,
++                                                   int hidden, int iq1_s_type);
++
++}  // namespace dist
++}  // namespace tp
++}  // namespace sparkinfer
+diff --git a/runtime/src/models/kimi_k3_dist_rank.cpp b/runtime/src/models/kimi_k3_dist_rank.cpp
+new file mode 100755
+index 0000000..93553cd
+--- /dev/null
++++ b/runtime/src/models/kimi_k3_dist_rank.cpp
+@@ -0,0 +1,182 @@
++#include "sparkinfer/models/kimi_k3_dist_rank.h"
++
++#include "sparkinfer/gguf.h"
++#include "sparkinfer/models/kimi_k3_gguf_config.h"
++
++#include <cstdio>
++#include <string>
++
++namespace sparkinfer {
++namespace {
++
++void set_err(std::string* error, const std::string& v) {
++    if (error) *error = v;
++}
++
++}  // namespace
++
++bool kimi_k3_dist_rank_load(const std::string& gguf_first_shard,
++                            const tp::dist::RankSpec& spec,
++                            const KimiK3DistRankLoadOptions& opt,
++                            KimiK3DistRank* out,
++                            std::string* error) {
++    if (!out) {
++        set_err(error, "null out");
++        return false;
++    }
++    kimi_k3_dist_rank_free(out);
++    *out = KimiK3DistRank{};
++
++    {
++        const tp::ShardError e = tp::dist::plan_rank_local_moe_budget(spec, &out->budget);
++        if (!e.ok()) {
++            set_err(error, e.message);
++            return false;
++        }
++        out->plan = out->budget.plan;
++    }
++    if (opt.verbose) {
++        std::fprintf(stderr, "[k3-dist] %s\n", out->plan.geometry_line.c_str());
++        std::fprintf(stderr, "[k3-dist] moe budget receipt %s\n", out->budget.receipt.c_str());
++        if (out->budget.estimated_moe_rank_bytes > (100ull << 30)) {
++            std::fprintf(stderr,
++                         "[k3-dist] WARNING: MoE rank bytes alone > 100 GiB; "
++                         "watch swap at ctx=%d\n",
++                         opt.max_ctx);
++        }
++    }
++
++    if (spec.world_size == tp::dist::kK3Tp3WorldSize) {
++        const double f = out->budget.moe_rank_frac;
++        if (f < 0.30 || f > 0.37) {
++            set_err(error, "TP3 MoE rank fraction outside [0.30,0.37] — refusing load");
++            return false;
++        }
++    }
++
++    out->device = spec.local_device;
++    if (cudaSetDevice(out->device) != cudaSuccess) {
++        set_err(error, "cudaSetDevice failed");
++        return false;
++    }
++    if (cudaStreamCreate(&out->stream) != cudaSuccess) {
++        set_err(error, "cudaStreamCreate failed");
++        return false;
++    }
++
++    GGUF g;
++    GGUFOpenOptions gopt;
++    gopt.verbose = opt.verbose;
++    if (!g.open(gguf_first_shard, gopt)) {
++        set_err(error, "GGUF open failed: " + gguf_first_shard);
++        return false;
++    }
++    if (g.is_partial()) {
++        set_err(error, "GGUF is partial (missing shards) — refusing distributed load");
++        return false;
++    }
++
++    if (!kimi_k3_config_from_gguf(g, out->cfg)) {
++        set_err(error, "kimi_k3_config_from_gguf failed");
++        return false;
++    }
++    if (out->cfg.n_experts != 896 || out->cfg.moe_ffn != 1536) {
++        set_err(error,
++                "GGUF MoE geometry is not the Neuron 896x1536 recipe target "
++                "(got n_experts=" +
++                    std::to_string(out->cfg.n_experts) +
++                    " moe_ffn=" + std::to_string(out->cfg.moe_ffn) + ")");
++        return false;
++    }
++    if (out->cfg.expert_latent != 3584) {
++        set_err(error, "unexpected expert_latent (want 3584)");
++        return false;
++    }
++
++    out->weights.policy = opt.policy;
++    out->weights.shard = out->plan.dims;
++    out->weights.shard.tp_size = spec.world_size;
++    out->weights.shard.rank = spec.rank;
++    out->weights.shard.hidden = out->cfg.hidden;
++    out->weights.shard.n_experts_total = out->cfg.n_experts;
++    out->weights.shard.moe_ffn_total = out->cfg.moe_ffn;
++
++    const bool load_head = (spec.rank == 0);
++    const bool load_embed = opt.load_embed_all_ranks || (spec.rank == 0);
++
++    if (!kimi_k3_load_weights_scoped(g, out->cfg, out->opt, out->weights,
++                                     /*first_layer=*/0,
++                                     /*last_layer=*/out->cfg.n_layers - 1, load_embed,
++                                     load_head)) {
++        set_err(error, "kimi_k3_load_weights_scoped failed");
++        return false;
++    }
++
++    for (int i = 0; i < out->cfg.n_layers; ++i) {
++        if (i < out->cfg.leading_dense) continue;
++        const auto& L = out->weights.layers[(size_t)i];
++        if (!L.ffn_gate_exps.ok()) continue;
++        if (L.ffn_gate_exps.rank_ne[1] != out->weights.shard.moe_ffn) {
++            set_err(error,
++                    "post-load gate rank_ne[1] != shard.moe_ffn on layer " +
++                        std::to_string(i));
++            return false;
++        }
++        if (L.ffn_down_exps.ok() &&
++            L.ffn_down_exps.rank_ne[0] != out->weights.shard.moe_ffn) {
++            set_err(error,
++                    "post-load down rank_ne[0] != shard.moe_ffn on layer " +
++                        std::to_string(i));
++            return false;
++        }
++        break;
++    }
++
++    if (!kimi_k3_alloc_state(out->cfg, opt.max_ctx, out->state, -1, -1, &out->weights.kda)) {
++        set_err(error, "kimi_k3_alloc_state failed");
++        return false;
++    }
++
++    out->fwd.cfg = &out->cfg;
++    out->fwd.w = &out->weights;
++    out->fwd.state = &out->state;
++    out->fwd.opt = out->opt;
++    out->fwd.stream = out->stream;
++    if (!kimi_k3_forward_alloc_scratch(out->cfg, out->fwd)) {
++        set_err(error, "forward_alloc_scratch failed");
++        return false;
++    }
++
++    if (cudaMalloc(&out->x, (size_t)out->cfg.hidden * sizeof(float)) != cudaSuccess ||
++        cudaMalloc(&out->x_next, (size_t)out->cfg.hidden * sizeof(float)) != cudaSuccess) {
++        set_err(error, "cudaMalloc x/x_next failed");
++        return false;
++    }
++
++    out->loaded = true;
++    if (opt.verbose) {
++        std::fprintf(stderr,
++                     "[k3-dist] rank %d loaded ok (embed=%s head=%s max_ctx=%d "
++                     "moe_ffn_local=%d)\n",
++                     spec.rank, load_embed ? "yes" : "no", load_head ? "yes" : "no",
++                     opt.max_ctx, out->weights.shard.moe_ffn);
++    }
++    return true;
++}
++
++void kimi_k3_dist_rank_free(KimiK3DistRank* r) {
++    if (!r) return;
++    // Best-effort teardown; safe on a zeroed struct.
++    if (r->stream || r->loaded) {
++        cudaSetDevice(r->device);
++        if (r->x) cudaFree(r->x);
++        if (r->x_next) cudaFree(r->x_next);
++        if (r->fwd.s) kimi_k3_forward_free_scratch(r->fwd);
++        kimi_k3_free_state(r->state);
++        kimi_k3_free_weights(r->weights);
++        if (r->stream) cudaStreamDestroy(r->stream);
++    }
++    *r = KimiK3DistRank{};
++}
++
++}  // namespace sparkinfer
+diff --git a/runtime/src/tp/rank_local_loader.cpp b/runtime/src/tp/rank_local_loader.cpp
+new file mode 100755
+index 0000000..5ae08c9
+--- /dev/null
++++ b/runtime/src/tp/rank_local_loader.cpp
+@@ -0,0 +1,79 @@
++#include "sparkinfer/tp/rank_local_loader.h"
++
++#include <sstream>
++#include <string>
++
++namespace sparkinfer {
++namespace tp {
++namespace dist {
++
++std::vector<TensorDesc> k3_neuron_moe_layer_descs(int layer, int n_experts, int moe_ffn,
++                                                   int hidden, int iq1_s_type) {
++    // GGUF ne order: ne0 fastest.
++    //   gate/up: ne0=hidden(in), ne1=ffn(out), ne2=experts — ExpertRow2D bands ne1
++    //   down:    ne0=ffn(in), ne1=hidden(out), ne2=experts — ExpertCol2D bands ne0
++    auto one = [&](const char* suf, long ne0, long ne1, long ne2) {
++        TensorDesc t;
++        t.name = "blk." + std::to_string(layer) + "." + suf;
++        t.ne[0] = ne0;
++        t.ne[1] = ne1;
++        t.ne[2] = ne2;
++        t.ne[3] = 1;
++        t.n_dims = 3;
++        t.ggml_type = iq1_s_type;
++        return t;
++    };
++    std::vector<TensorDesc> out;
++    out.push_back(one("ffn_gate_exps.weight", hidden, moe_ffn, n_experts));
++    out.push_back(one("ffn_up_exps.weight", hidden, moe_ffn, n_experts));
++    out.push_back(one("ffn_down_exps.weight", moe_ffn, hidden, n_experts));
++    return out;
++}
++
++ShardError plan_rank_local_moe_budget(const RankSpec& spec, RankLocalBudget* out,
++                                      int iq1_s_type) {
++    if (!out) return ShardError{"plan_rank_local_moe_budget: null out"};
++    RankLocalBudget b;
++    const ShardError pe = make_rank_local_plan(spec, &b.plan);
++    if (!pe.ok()) return pe;
++
++    constexpr int kExperts = 896;
++    constexpr int kMoeFfn = 1536;
++    constexpr int kHidden = 3584;
++    std::vector<TensorDesc> tensors;
++    tensors.reserve(92 * 3);
++    for (int layer = 1; layer <= 92; ++layer) {
++        auto part = k3_neuron_moe_layer_descs(layer, kExperts, kMoeFfn, kHidden, iq1_s_type);
++        tensors.insert(tensors.end(), part.begin(), part.end());
++    }
++
++    b.moe_report = plan_model_residency(tensors, b.plan.dims, nullptr);
++    if (b.moe_report.failed > 0) {
++        std::ostringstream os;
++        os << "moe residency planning failed for " << b.moe_report.failed << " tensors";
++        if (!b.moe_report.errors.empty()) os << ": " << b.moe_report.errors.front();
++        return ShardError{os.str()};
++    }
++    b.estimated_moe_rank_bytes = b.moe_report.bytes_rank;
++    b.estimated_moe_model_bytes = b.moe_report.bytes_model;
++    b.moe_rank_frac =
++        b.estimated_moe_model_bytes
++            ? (double)b.estimated_moe_rank_bytes / (double)b.estimated_moe_model_bytes
++            : 0.0;
++
++    std::ostringstream rec;
++    rec << "{"
++        << "\"geometry\":\"" << b.plan.geometry_line << "\","
++        << "\"moe_tensors\":" << b.moe_report.tensors << ","
++        << "\"moe_rank_bytes\":" << b.estimated_moe_rank_bytes << ","
++        << "\"moe_model_bytes\":" << b.estimated_moe_model_bytes << ","
++        << "\"moe_rank_frac\":" << b.moe_rank_frac << ","
++        << "\"load_head\":" << (spec.rank == 0 ? "true" : "false") << "}";
++    b.receipt = rec.str();
++    *out = std::move(b);
++    return ShardError{};
++}
++
++}  // namespace dist
++}  // namespace tp
++}  // namespace sparkinfer
+diff --git a/runtime/tests/CMakeLists.txt b/runtime/tests/CMakeLists.txt
+index a192b21..5534855 100644
+--- a/runtime/tests/CMakeLists.txt
++++ b/runtime/tests/CMakeLists.txt
+@@ -129,3 +129,27 @@ add_executable(kimi_k3_decode_plan_cpu_test kimi_k3_decode_plan_cpu_test.cpp
+ set_target_properties(kimi_k3_decode_plan_cpu_test PROPERTIES CXX_STANDARD 17)
+ target_include_directories(kimi_k3_decode_plan_cpu_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+ add_test(NAME kimi_k3_decode_plan_cpu_test COMMAND kimi_k3_decode_plan_cpu_test)
++
++# Rank-local plan helper (geometry only).
++add_executable(tp_rank_local_plan_cpu_test tp_rank_local_plan_cpu_test.cpp
++               ../src/tp/rank_local_plan.cpp
++               ../src/tp/rank_protocol.cpp
++               ../src/tp/weight_plan.cpp
++               ../src/tp/shard.cpp)
++set_target_properties(tp_rank_local_plan_cpu_test PROPERTIES CXX_STANDARD 17)
++target_include_directories(tp_rank_local_plan_cpu_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
++add_test(NAME tp_rank_local_plan_cpu_test COMMAND tp_rank_local_plan_cpu_test)
++
++# Rank-local MoE residency budget for distributed TP3/TP4 (CPU; no GGUF bytes).
++add_executable(tp_rank_local_loader_cpu_test tp_rank_local_loader_cpu_test.cpp
++               ../src/tp/rank_local_loader.cpp
++               ../src/tp/rank_local_plan.cpp
++               ../src/tp/rank_protocol.cpp
++               ../src/tp/weight_residency.cpp
++               ../src/tp/weight_plan.cpp
++               ../src/tp/shard.cpp
++               ../src/gguf.cpp)
++set_target_properties(tp_rank_local_loader_cpu_test PROPERTIES CXX_STANDARD 17)
++target_include_directories(tp_rank_local_loader_cpu_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
++add_test(NAME tp_rank_local_loader_cpu_test COMMAND tp_rank_local_loader_cpu_test)
++
+diff --git a/runtime/tests/tp_rank_local_loader_cpu_test.cpp b/runtime/tests/tp_rank_local_loader_cpu_test.cpp
+new file mode 100755
+index 0000000..2195258
+--- /dev/null
++++ b/runtime/tests/tp_rank_local_loader_cpu_test.cpp
+@@ -0,0 +1,117 @@
++// CPU test: rank-local MoE residency budget for TP3 (and TP4 dry-run).
++// No CUDA. Proves ~1/3 of routed-expert bytes land on each TP3 rank under
++// AllExpertsFfnWidth with Neuron shapes (896 experts x 1536 ffn, IQ1_S).
++
++#include "sparkinfer/tp/rank_local_loader.h"
++#include "sparkinfer/tp/rank_protocol.h"
++
++#include <cstdio>
++#include <cstdlib>
++#include <string>
++
++using namespace sparkinfer::tp;
++using namespace sparkinfer::tp::dist;
++
++static int g_fail = 0;
++static int g_pass = 0;
++
++static void check(bool cond, const std::string& what) {
++    if (cond) {
++        ++g_pass;
++        return;
++    }
++    ++g_fail;
++    std::printf("FAIL: %s\n", what.c_str());
++}
++
++static void check_near(double v, double lo, double hi, const std::string& what) {
++    check(v >= lo && v <= hi, what + " (got " + std::to_string(v) + ")");
++}
++
++int main() {
++    std::size_t model_bytes = 0;
++    std::size_t sum_rank = 0;
++    for (int r = 0; r < 3; ++r) {
++        RankSpec spec;
++        spec.session_id = 1;
++        spec.world_size = 3;
++        spec.rank = r;
++        spec.local_device = 0;
++        spec.vocab = 163840;
++        spec.model_digest[0] = 0xA5;
++        spec.plan_digest[0] = 0x5A;
++        RankLocalBudget b;
++        ShardError e = plan_rank_local_moe_budget(spec, &b);
++        check(e.ok(), "plan rank " + std::to_string(r) + " ok");
++        if (!e.ok()) {
++            std::printf("  err: %s\n", e.message.c_str());
++            continue;
++        }
++        check(b.plan.dims.moe_shard_mode == MoeShardMode::AllExpertsFfnWidth,
++              "mode AllExpertsFfnWidth");
++        check(b.plan.dims.n_experts == 896, "all 896 experts");
++        check(b.plan.dims.moe_ffn == 512, "ffn local 512");
++        check(b.plan.dims.moe_ffn_band.offset == r * 512, "ffn band offset");
++        check(b.moe_report.tensors == 92 * 3, "92 layers x 3 tensors");
++        check(b.moe_report.failed == 0, "no residency failures");
++        check_near(b.moe_rank_frac, 0.32, 0.35, "moe_rank_frac ~ 1/3");
++        if (r == 0) {
++            model_bytes = b.estimated_moe_model_bytes;
++            check(b.plan.full_lm_head_on_rank0_only, "lm head rank0 only flag");
++            check(b.receipt.find("\"load_head\":true") != std::string::npos, "receipt head true");
++        } else {
++            check(b.estimated_moe_model_bytes == model_bytes, "model bytes stable");
++            check(b.receipt.find("\"load_head\":false") != std::string::npos, "receipt head false");
++        }
++        sum_rank += b.estimated_moe_rank_bytes;
++        std::printf("rank %d: moe_rank_bytes=%zu frac=%.4f geo=%s\n", r,
++                    b.estimated_moe_rank_bytes, b.moe_rank_frac, b.plan.geometry_line.c_str());
++    }
++    if (model_bytes > 0) {
++        const double cover = (double)sum_rank / (double)model_bytes;
++        check_near(cover, 0.99, 1.01, "sum of rank MoE bytes ~= model MoE bytes");
++        std::printf("coverage sum_rank/model = %.6f\n", cover);
++    }
++
++    {
++        auto d = k3_neuron_moe_layer_descs(1, 896, 1536, 3584, /*iq1_s=*/19);
++        check(d.size() == 3, "3 descs");
++        check(d[0].ne[0] == 3584 && d[0].ne[1] == 1536 && d[0].ne[2] == 896, "gate shape");
++        check(d[2].ne[0] == 1536 && d[2].ne[1] == 3584 && d[2].ne[2] == 896, "down shape");
++    }
++
++    {
++        RankSpec bad;
++        bad.session_id = 1;
++        bad.world_size = 5;
++        bad.rank = 0;
++        bad.vocab = 163840;
++        bad.model_digest[0] = 0xA5;
++        bad.plan_digest[0] = 0x5A;
++        RankLocalBudget b;
++        ShardError e = plan_rank_local_moe_budget(bad, &b);
++        check(!e.ok(), "world=5 rejected");
++    }
++
++    {
++        RankSpec spec;
++        spec.session_id = 1;
++        spec.world_size = 4;
++        spec.rank = 0;
++        spec.vocab = 163840;
++        spec.model_digest[0] = 0xA5;
++        spec.plan_digest[0] = 0x5A;
++        RankLocalBudget b;
++        ShardError e = plan_rank_local_moe_budget(spec, &b);
++        check(e.ok(), "TP4 budget ok");
++        if (e.ok()) {
++            check(b.plan.dims.moe_2d, "TP4 moe_2d");
++            check(b.moe_report.failed == 0, "TP4 residency ok");
++            std::printf("tp4 rank0 frac=%.4f\n", b.moe_rank_frac);
++        }
++    }
++
++    std::printf("tp_rank_local_loader_cpu_test: %d checks, %d failures\n", g_pass + g_fail,
++                g_fail);
++    return g_fail ? 1 : 0;
++}
+-- 
+2.43.0
+

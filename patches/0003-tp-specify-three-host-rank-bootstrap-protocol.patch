@@ -1,0 +1,1658 @@
+From 02dc78111aa1d595cefd1ca51d41421ba02d6043 Mon Sep 17 00:00:00 2001
+From: Codex Prototype <noreply@openai.com>
+Date: Thu, 6 Aug 2026 19:16:16 -0700
+Subject: [PATCH 03/12] tp: specify three-host rank bootstrap protocol
+
+---
+ docs/k3-tp3-distributed-rank-protocol.md      | 121 +++
+ runtime/include/sparkinfer/tp/rank_protocol.h | 244 ++++++
+ runtime/src/tp/rank_protocol.cpp              | 720 ++++++++++++++++++
+ runtime/tests/CMakeLists.txt                  |   8 +
+ runtime/tests/tp3_rank_protocol_cpu_test.cpp  | 510 +++++++++++++
+ 5 files changed, 1603 insertions(+)
+ create mode 100644 docs/k3-tp3-distributed-rank-protocol.md
+ create mode 100644 runtime/include/sparkinfer/tp/rank_protocol.h
+ create mode 100644 runtime/src/tp/rank_protocol.cpp
+ create mode 100644 runtime/tests/tp3_rank_protocol_cpu_test.cpp
+
+diff --git a/docs/k3-tp3-distributed-rank-protocol.md b/docs/k3-tp3-distributed-rank-protocol.md
+new file mode 100644
+index 0000000..473fa20
+--- /dev/null
++++ b/docs/k3-tp3-distributed-rank-protocol.md
+@@ -0,0 +1,121 @@
++# K3 TP3 across three physical DGX Sparks: gated implementation map
++
++This document accompanies the CPU-only `rank_protocol` milestone. It is a design
++and validation contract, **not evidence of CUDA, NCCL, or multi-host execution**.
++
++## Process topology
++
++Run exactly one process and one local CUDA device per Spark:
++
++```text
++global rank 0 / local device 0   coordinator + sampler + full LM head
++global rank 1 / local device 0   worker
++global rank 2 / local device 0   worker
++```
++
++Global rank must never be confused with CUDA ordinal. `ncclCommInitAll({0,1,2})`
++cannot span these hosts; every process sees its own device 0.
++
++## Control-plane sequence
++
++```text
++all ranks -> Hello(model digest, plan digest, exact TP3 shape)
++rank 0    -> ncclGetUniqueId()
++rank 0    -> NcclUniqueId(same opaque 128 bytes to ranks 0/1/2)
++each rank -> ncclCommInitRank(world=3, id, global_rank)
++all ranks -> NcclReady
++rank 0    -> BeginLoad
++each rank -> open local GGUF set; load only its planned rank slice
++all ranks -> LoadReady
++rank 0    -> Token(sequence, token_id)
++all ranks -> one local forward step with distributed NCCL collectives
++all ranks -> StepDone(sequence)
++rank 0    -> sample next token, then broadcast the next Token
++rank 0    -> Finish(next sequence) after EOS
++all ranks -> FinishAck(next sequence), then close cleanly
++```
++
++Any timeout, protocol violation, CUDA failure, loader failure, NCCL async error, or
++forward failure is sticky. Rank 0 broadcasts `Abort`; the control thread on every
++host must call `ncclCommAbort` before joining the compute thread. Continuing after
++one rank leaves a collective is forbidden because the remaining ranks can block or
++consume partial state indefinitely.
++
++CRC32 detects accidental frame corruption. It is not authentication. The transport
++must bind each connection to exactly one configured global rank (or a mutually
++authenticated certificate identity), reject duplicate live rank connections, and
++pass a nonzero, connection-stable `AuthenticatedPeer` to `Coordinator::accept`.
++The coordinator rejects any rank mismatch with the in-band `Message::rank`, any
++unset connection id, and any second connection id for an already bound rank;
++callers must never derive this identity from the message body. Use a private cluster
++network or mutually authenticated TLS if peers are not fully trusted.
++
++The fixed header is 16 bytes and the payload is bounded to 250..506 bytes
++(`kMaxFrameBytes == 522`). A transport must reject a declared payload outside that
++range before allocating a receive buffer or reading the body.
++
++## Exact implementation map
++
++| File / symbol | Required next change | Gate before proceeding |
++|---|---|---|
++| `runtime/include/sparkinfer/tp/collective.h` | Add a distinct one-rank-per-process collective API with in-place `allreduce_f32`, async-error query, and `abort`. Do not overload the existing group-vector contract. | CPU interface test; default local collective unchanged. |
++| `runtime/src/tp/collective.cpp` / `NcclCollective::create` | Leave `ncclCommInitAll` intact for one-host TP. Add `NcclRankCollective::create(world, rank, local_device, id)` using `ncclCommInitRank`. Add `static_assert(sizeof(ncclUniqueId) == dist::kNcclUniqueIdBytes)`. | Three-process NCCL microtest: repeated f32 sums, timeout, deliberate rank abort. No model. |
++| New `runtime/include/sparkinfer/tp/rank_transport.h` and `runtime/src/tp/rank_transport_tcp.cpp` | Blocking framed send/receive around `encode_message`/`decode_message`, reject headers above `kMaxFrameBytes` before body allocation, connection and phase deadlines, one authenticated/configured connection per rank, and a dedicated control thread able to deliver Abort while compute is blocked. | Three localhost processes complete bootstrap, two token steps, clean Finish/FinishAck, rank-spoof, duplicate-connection, disconnect, timeout, and corrupt/oversize-frame tests. |
++| `runtime/include/sparkinfer/models/kimi_k3_tp.h` | Add a separate `KimiK3DistributedRank` holding one `KimiK3TPRank`, one local stream, one rank collective, and `RankSession`. Do not put remote ranks into `KimiK3TP::ranks`. | Compile-only with TP off; ownership/free tests. |
++| `runtime/src/models/kimi_k3_tp.cpp` / `kimi_k3_tp_init` | Preserve the existing local TP path. Add `kimi_k3_dist_rank_init` instead of weakening the current guard globally. Validate the exact rank spec and homogeneous supported expert qtypes, then call `moe_all_expert_width_dims(896,1536,3,rank,256,...)`. | Each rank logs `[0,896)` experts and FFN bands `[0,512)`, `[512,1024)`, `[1024,1536)`; any drift is fatal. |
++| `runtime/src/models/kimi_k3.cpp` / `k3_moe_ffn_local` | Honor `MoeShardMode::AllExpertsFfnWidth`, returning 512. Today it only recognizes `shard.moe_2d`. | Scratch and weight strides agree at 512 in decode and prefill tests. |
++| `runtime/src/models/kimi_k3.cpp` / `upload_sliced` | Reuse the planner-produced `ExpertRow2D` gate/up copies and `ExpertCol2D` down copy. Keep all 896 expert identities. Do not invent offsets in the loader. | Per-rank byte hashes of small synthetic expert tensors match CPU plan; real release triplets pass the fail-closed quant contract. |
++| `runtime/src/models/kimi_k3_tp.cpp` / `kimi_k3_tp_forward_token` | Extract a rank-local eager forward: embed; Attn; optional per-rank NCCL reduce; FfnPartial; per-rank NCCL reduce; FfnFinish; swap. Remove `issue_all` and group-vector reductions only in the new distributed path. | One synthetic layer vs TP1, then one full eager token vs TP1. `SPARKINFER_K3_MOE_WEPS=0`. |
++| Same forward, graph code | Disable CUDA graph capture initially. Cross-process NCCL graph capture is a later optimization, not a bring-up dependency. | Eager parity established before any capture experiment. |
++| Same forward, head block | For the first correct implementation, keep a full output head on rank 0 and skip it on ranks 1/2. Rank 0 samples, then broadcasts the next token. Do not attempt the existing local multi-device logit-band gather across hosts. | Full logits on rank 0 match TP1 within the agreed float32 reduction tolerance. |
++| New `runtime/examples/kimi_k3_dist_generate.cpp` | CLI for `--rank`, `--world-size 3`, `--coordinator`, `--local-device 0`, manifest digest, and timeouts. Rank 0 alone tokenizes/samples/prints. | Identical prompt/token sequence logged by all ranks; rank 1/2 never sample. |
++| `runtime/CMakeLists.txt`, `runtime/tests/CMakeLists.txt` | Keep `rank_protocol` CPU-only and unconditional; compile TCP and NCCL adapters behind explicit options. | Normal TP-off CPU CI stays green. |
++
++## Model and plan identity
++
++Do not hash 330 GB at every launch. Distribute a signed/canonical manifest containing
++the nine shard names, sizes, and precomputed SHA-256 values. `model_digest` is the
++SHA-256 of that canonical manifest. `plan_digest` is the SHA-256 of the exact runtime
++base/patch identifiers plus the tensor-role/qtype contract and these fixed values:
++
++```text
++world=3, experts=896, moe_ffn=1536, block=256
++rank0 ffn=[0,512), rank1=[512,1024), rank2=[1024,1536)
++gate/up split ne1; down split ne0; WEPS=0
++```
++
++Every message repeats both digests. A mismatch aborts before NCCL initialization or
++model loading.
++
++## Why the first head must be rank-0-only
++
++The current one-host path bands the vocabulary and copies all logit bands into one
++host buffer. Across physical Sparks that becomes a new variable-size gather because
++`163840 % 3 != 0`. For the correctness milestone, retain the full output head only
++on rank 0. All ranks already hold the same post-reduce hidden state. This avoids a
++second distributed protocol and keeps temperature-0.2 sampling exact. Optimize the
++head only after end-to-end parity.
++
++## Validation ladder
++
++1. CPU protocol test in this patch.
++2. Three localhost processes using the future TCP adapter; no CUDA.
++3. Three Sparks running only a repeated NCCL f32 all-reduce microtest.
++4. Synthetic expert layer with 896 identities and 512-wide local bands.
++5. One full eager token, approximation off, versus TP1 logits.
++6. Multiple depths including a real long prompt; report KLD, top-1 agreement, RMS
++   delta-probability, and generated-token identity.
++7. Only then benchmark tokens/s and consider graph capture or head sharding.
++
++## Futile or unsafe shortcuts
++
++- `ncclCommInitAll` with device ordinals 0/1/2 across machines.
++- Putting remote Sparks into the existing `KimiK3TP::ranks` vector.
++- Calling group-vector collectives with one local buffer and pretending missing
++  remote buffers are local.
++- Removing only the `896 % 3` guard without the 512-width executor change.
++- Treating gate/up/down as one generic column shard.
++- Enabling peer-one-shot or NVSwitch multimem across separate Sparks.
++- Benchmarking with `SPARKINFER_K3_MOE_WEPS` enabled before long-context parity.
++- Adding FlashKDA, speculative decoding, or vLLM code to this bring-up path; none
++  solves the one-rank-per-process state/collective contract.
+diff --git a/runtime/include/sparkinfer/tp/rank_protocol.h b/runtime/include/sparkinfer/tp/rank_protocol.h
+new file mode 100644
+index 0000000..db14508
+--- /dev/null
++++ b/runtime/include/sparkinfer/tp/rank_protocol.h
+@@ -0,0 +1,244 @@
++#pragma once
++// CPU-only control-plane contract for one K3 TP rank per physical host.
++//
++// This file deliberately contains no sockets, CUDA, or NCCL. It defines the wire
++// frames and the coordinator/rank state machines that a transport adapter must drive.
++// Keeping the protocol independent makes ordering, replay rejection, rank-local
++// loading, token synchronization, and sticky failure propagation testable before a
++// collective can strand three expensive hosts in different phases.
++
++#include <array>
++#include <cstddef>
++#include <cstdint>
++#include <string>
++#include <vector>
++
++#include "sparkinfer/tp/shard.h"
++
++namespace sparkinfer {
++namespace tp {
++namespace dist {
++
++constexpr std::uint16_t kProtocolVersion = 1;
++constexpr int kK3Tp3WorldSize = 3;
++constexpr int kNcclUniqueIdBytes = 128;
++constexpr std::size_t kDigestBytes = 32;
++constexpr std::size_t kMaxDetailBytes = 256;
++constexpr std::size_t kWireHeaderBytes = 16;
++constexpr std::size_t kWireFixedPayloadBytes = 250;
++constexpr std::size_t kMaxPayloadBytes = kWireFixedPayloadBytes + kMaxDetailBytes;
++constexpr std::size_t kMaxFrameBytes = kWireHeaderBytes + kMaxPayloadBytes;
++
++using Digest = std::array<std::uint8_t, kDigestBytes>;
++using NcclUniqueId = std::array<std::uint8_t, kNcclUniqueIdBytes>;
++
++enum class MessageType : std::uint16_t {
++    Hello = 1,
++    NcclUniqueId = 2,
++    NcclReady = 3,
++    BeginLoad = 4,
++    LoadReady = 5,
++    Token = 6,
++    StepDone = 7,
++    Failure = 8,
++    Abort = 9,
++    Finish = 10,
++    FinishAck = 11,
++};
++
++enum class Phase : std::uint16_t {
++    None = 0,
++    Bootstrap = 1,
++    NcclInit = 2,
++    Load = 3,
++    Step = 4,
++    Shutdown = 5,
++};
++
++// One process owns one local device. All three DGX Sparks may therefore use local
++// CUDA ordinal 0 while retaining distinct GLOBAL ranks 0/1/2.
++struct RankSpec {
++    std::uint64_t session_id = 0;
++    int world_size = kK3Tp3WorldSize;
++    int rank = 0;
++    int local_device = 0;
++    int n_experts = 896;
++    int moe_ffn = 1536;
++    int expert_block_elems = 256;
++    int vocab = 0;
++    Digest model_digest{};
++    Digest plan_digest{};
++};
++
++// Validates the exact three-Spark target and returns this rank's all-expert width
++// plan. The returned descriptor always has expert_band=[0,896) and a 512-wide FFN
++// band on the rank's correct third.
++ShardError validate_rank_spec(const RankSpec& spec, ShardDims* out);
++
++// Fixed-schema message. Every frame carries the cluster identity, so a delayed
++// packet from a prior session or another model cannot be mistaken for progress.
++struct Message {
++    MessageType type = MessageType::Hello;
++    std::uint64_t session_id = 0;
++    std::uint64_t sequence = 0;
++    int rank = -1;               // sender for replies; target for coordinator controls
++    int world_size = 0;
++    int local_device = 0;
++    int n_experts = 0;
++    int moe_ffn = 0;
++    int expert_block_elems = 0;
++    int vocab = 0;
++    int token_id = -1;
++    int status = 0;
++    Phase phase = Phase::None;
++    Digest model_digest{};
++    Digest plan_digest{};
++    NcclUniqueId nccl_id{};
++    std::string detail;
++};
++
++// Out-of-band identity supplied by the transport after it has authenticated or
++// statically configured a connection. connection_id is a nonzero, process-local
++// handle that stays stable for that socket/TLS session; it is never serialized.
++struct AuthenticatedPeer {
++    int rank = -1;
++    std::uint64_t connection_id = 0;
++};
++
++// Explicit little-endian framing with CRC32. Decode rejects unknown versions/types,
++// length mismatches, corrupt payloads, and oversized diagnostic strings.
++bool encode_message(const Message& message, std::vector<std::uint8_t>* frame,
++                    std::string* error = nullptr);
++bool decode_message(const std::uint8_t* frame, std::size_t size, Message* message,
++                    std::string* error = nullptr);
++
++enum class CoordinatorState {
++    CollectingHello,
++    AwaitingNcclUniqueId,
++    WaitingNcclReady,
++    WaitingLoadReady,
++    Ready,
++    StepInFlight,
++    WaitingFinishAck,
++    Finished,
++    Failed,
++};
++
++// Rank 0's control-plane state machine. It never creates an NCCL id itself: the
++// future NCCL adapter calls ncclGetUniqueId, copies the opaque 128 bytes, then calls
++// install_nccl_unique_id().
++class Coordinator {
++public:
++    explicit Coordinator(const RankSpec& cluster);
++
++    CoordinatorState state() const { return state_; }
++    bool good() const { return state_ != CoordinatorState::Failed; }
++    std::uint64_t next_sequence() const { return next_sequence_; }
++    const std::string& failure() const { return failure_; }
++
++    // Accept a rank-to-coordinator message from a transport-authenticated peer.
++    // peer comes from the connection binding, never from the in-band Message::rank
++    // field. A rank is bound to its first valid Hello connection; a second live
++    // connection cannot impersonate it. Outbound messages are appended, never
++    // silently discarded. Any protocol violation fails the cluster and appends one
++    // Abort per rank.
++    bool accept(const AuthenticatedPeer& peer, const Message& message,
++                std::vector<Message>* outbound,
++                std::string* error = nullptr);
++
++    bool install_nccl_unique_id(const NcclUniqueId& id,
++                                std::vector<Message>* outbound,
++                                std::string* error = nullptr);
++
++    // Broadcast one input token. A second token cannot start until every rank has
++    // acknowledged StepDone for the current sequence.
++    bool begin_step(int token_id, std::vector<Message>* outbound,
++                    std::string* error = nullptr);
++
++    // Clean EOS. Finish is sequence-gated and acknowledged by every rank; Finished
++    // is distinct from Failed so a normal generator shutdown is never reported as
++    // an abort.
++    bool finish(std::vector<Message>* outbound, std::string* error = nullptr);
++
++    // Transport timeout/local coordinator failure. Failure is sticky.
++    bool fail(Phase phase, int status, const std::string& detail,
++              std::vector<Message>* outbound, std::string* error = nullptr);
++
++private:
++    RankSpec cluster_;
++    CoordinatorState state_ = CoordinatorState::CollectingHello;
++    std::vector<unsigned char> hello_;
++    std::vector<unsigned char> nccl_ready_;
++    std::vector<unsigned char> load_ready_;
++    std::vector<unsigned char> step_done_;
++    std::vector<unsigned char> finish_ack_;
++    std::vector<std::uint64_t> peer_connection_;
++    std::uint64_t next_sequence_ = 0;
++    std::string failure_;
++
++    bool matches_cluster(const Message& message, std::string* why) const;
++    Message control(MessageType type, int target) const;
++    bool abort_cluster(Phase phase, int status, const std::string& detail,
++                       std::vector<Message>* outbound, std::string* error);
++};
++
++enum class RankState {
++    Created,
++    HelloSent,
++    NeedNcclInit,
++    NcclReadySent,
++    Loading,
++    WaitingToken,
++    StepRunning,
++    FinishPending,
++    Finished,
++    Failed,
++};
++
++// One worker process's state machine. Actual NCCL init and GGUF loading happen
++// between these calls; the state gates their ordering and produces acknowledgements.
++class RankSession {
++public:
++    explicit RankSession(const RankSpec& spec);
++
++    RankState state() const { return state_; }
++    bool good() const { return state_ != RankState::Failed; }
++    std::uint64_t next_sequence() const { return next_sequence_; }
++    const NcclUniqueId& nccl_unique_id() const { return nccl_id_; }
++    const std::string& failure() const { return failure_; }
++
++    bool hello(Message* outbound, std::string* error = nullptr);
++
++    // Accept NcclUniqueId, BeginLoad, Token, Finish, or Abort. For Token, token_id
++    // receives the synchronized input. No later sequence is accepted before StepDone.
++    bool accept_control(const Message& message, int* token_id = nullptr,
++                        std::string* error = nullptr);
++
++    bool report_nccl_ready(bool success, int status, const std::string& detail,
++                           Message* outbound, std::string* error = nullptr);
++    bool report_load_ready(bool success, int status, const std::string& detail,
++                           Message* outbound, std::string* error = nullptr);
++    bool report_step_done(bool success, int status, const std::string& detail,
++                          Message* outbound, std::string* error = nullptr);
++    bool report_finish_ack(Message* outbound, std::string* error = nullptr);
++
++    // Serialize the sticky local failure after accept_control()/a transport check
++    // rejected input. This gives the coordinator an immediate Failure instead of
++    // waiting for its phase timeout to discover that the rank stopped.
++    bool failure_message(Phase phase, int status, Message* outbound,
++                         std::string* error = nullptr) const;
++
++private:
++    RankSpec spec_;
++    RankState state_ = RankState::Created;
++    std::uint64_t next_sequence_ = 0;
++    NcclUniqueId nccl_id_{};
++    std::string failure_;
++
++    Message reply(MessageType type, Phase phase) const;
++    bool reject(const std::string& detail, std::string* error);
++};
++
++}  // namespace dist
++}  // namespace tp
++}  // namespace sparkinfer
+diff --git a/runtime/src/tp/rank_protocol.cpp b/runtime/src/tp/rank_protocol.cpp
+new file mode 100644
+index 0000000..ec04ddc
+--- /dev/null
++++ b/runtime/src/tp/rank_protocol.cpp
+@@ -0,0 +1,720 @@
++#include "sparkinfer/tp/rank_protocol.h"
++
++#include <algorithm>
++#include <cstring>
++#include <utility>
++
++namespace sparkinfer {
++namespace tp {
++namespace dist {
++
++namespace {
++
++constexpr std::uint32_t kMagic = 0x5052334bU;  // little-endian bytes: "K3RP"
++
++void set_error(std::string* error, const std::string& value) {
++    if (error) *error = value;
++}
++
++template <std::size_t N>
++bool any_nonzero(const std::array<std::uint8_t, N>& bytes) {
++    for (std::uint8_t v : bytes) if (v != 0) return true;
++    return false;
++}
++
++bool valid_type(std::uint16_t v) {
++    return v >= static_cast<std::uint16_t>(MessageType::Hello) &&
++           v <= static_cast<std::uint16_t>(MessageType::FinishAck);
++}
++
++bool valid_phase(std::uint16_t v) {
++    return v <= static_cast<std::uint16_t>(Phase::Shutdown);
++}
++
++void put_u16(std::vector<std::uint8_t>& out, std::uint16_t v) {
++    out.push_back(static_cast<std::uint8_t>(v));
++    out.push_back(static_cast<std::uint8_t>(v >> 8));
++}
++
++void put_u32(std::vector<std::uint8_t>& out, std::uint32_t v) {
++    for (int i = 0; i < 4; ++i) out.push_back(static_cast<std::uint8_t>(v >> (8 * i)));
++}
++
++void put_u64(std::vector<std::uint8_t>& out, std::uint64_t v) {
++    for (int i = 0; i < 8; ++i) out.push_back(static_cast<std::uint8_t>(v >> (8 * i)));
++}
++
++void put_i32(std::vector<std::uint8_t>& out, int v) {
++    put_u32(out, static_cast<std::uint32_t>(static_cast<std::int32_t>(v)));
++}
++
++struct Reader {
++    const std::uint8_t* data = nullptr;
++    std::size_t size = 0;
++    std::size_t at = 0;
++
++    bool u16(std::uint16_t* out) {
++        if (!out || at + 2 > size) return false;
++        *out = static_cast<std::uint16_t>(data[at]) |
++               (static_cast<std::uint16_t>(data[at + 1]) << 8);
++        at += 2;
++        return true;
++    }
++    bool u32(std::uint32_t* out) {
++        if (!out || at + 4 > size) return false;
++        *out = 0;
++        for (int i = 0; i < 4; ++i)
++            *out |= static_cast<std::uint32_t>(data[at + i]) << (8 * i);
++        at += 4;
++        return true;
++    }
++    bool u64(std::uint64_t* out) {
++        if (!out || at + 8 > size) return false;
++        *out = 0;
++        for (int i = 0; i < 8; ++i)
++            *out |= static_cast<std::uint64_t>(data[at + i]) << (8 * i);
++        at += 8;
++        return true;
++    }
++    bool i32(int* out) {
++        std::uint32_t v = 0;
++        if (!u32(&v) || !out) return false;
++        // Avoid implementation-defined unsigned-to-signed conversion for wire
++        // values with the high bit set (negative status codes).
++        *out = v <= 0x7fffffffU
++            ? static_cast<int>(v)
++            : -1 - static_cast<int>(0xffffffffU - v);
++        return true;
++    }
++    bool bytes(std::uint8_t* out, std::size_t n) {
++        if (!out || at + n > size) return false;
++        std::memcpy(out, data + at, n);
++        at += n;
++        return true;
++    }
++};
++
++std::uint32_t crc32(const std::uint8_t* data, std::size_t size) {
++    std::uint32_t crc = 0xffffffffU;
++    for (std::size_t i = 0; i < size; ++i) {
++        crc ^= data[i];
++        for (int bit = 0; bit < 8; ++bit)
++            crc = (crc >> 1) ^ (0xedb88320U & (0U - (crc & 1U)));
++    }
++    return ~crc;
++}
++
++Message from_spec(const RankSpec& spec, MessageType type, int rank) {
++    Message m;
++    m.type = type;
++    m.session_id = spec.session_id;
++    m.rank = rank;
++    m.world_size = spec.world_size;
++    m.local_device = spec.local_device;
++    m.n_experts = spec.n_experts;
++    m.moe_ffn = spec.moe_ffn;
++    m.expert_block_elems = spec.expert_block_elems;
++    m.vocab = spec.vocab;
++    m.model_digest = spec.model_digest;
++    m.plan_digest = spec.plan_digest;
++    return m;
++}
++
++bool all_seen(const std::vector<unsigned char>& seen) {
++    return !seen.empty() &&
++           std::all_of(seen.begin(), seen.end(), [](unsigned char v) { return v != 0; });
++}
++
++Phase coordinator_phase(CoordinatorState state) {
++    switch (state) {
++        case CoordinatorState::CollectingHello:
++        case CoordinatorState::AwaitingNcclUniqueId: return Phase::Bootstrap;
++        case CoordinatorState::WaitingNcclReady: return Phase::NcclInit;
++        case CoordinatorState::WaitingLoadReady: return Phase::Load;
++        case CoordinatorState::Ready:
++        case CoordinatorState::StepInFlight: return Phase::Step;
++        case CoordinatorState::WaitingFinishAck:
++        case CoordinatorState::Finished:
++        case CoordinatorState::Failed: return Phase::Shutdown;
++    }
++    return Phase::None;
++}
++
++}  // namespace
++
++ShardError validate_rank_spec(const RankSpec& spec, ShardDims* out) {
++    if (!out) return ShardError{"validate_rank_spec: null out"};
++    if (spec.session_id == 0) return ShardError{"session_id must be nonzero"};
++    if (spec.world_size != kK3Tp3WorldSize)
++        return ShardError{"this milestone requires world_size=3"};
++    if (spec.rank < 0 || spec.rank >= spec.world_size)
++        return ShardError{"rank outside [0,3)"};
++    if (spec.local_device != 0)
++        return ShardError{"one-process-per-Spark milestone requires local_device=0"};
++    if (spec.n_experts != 896)
++        return ShardError{"this K3 TP3 plan requires exactly 896 routed experts"};
++    if (spec.moe_ffn != 1536)
++        return ShardError{"this pruned K3 TP3 plan requires moe_ffn=1536"};
++    if (spec.expert_block_elems != 256)
++        return ShardError{"this IQ1_S K3 TP3 plan requires 256-element expert blocks"};
++    if (spec.vocab <= 0) return ShardError{"vocab must be > 0"};
++    if (!any_nonzero(spec.model_digest)) return ShardError{"model_digest is unset"};
++    if (!any_nonzero(spec.plan_digest)) return ShardError{"plan_digest is unset"};
++
++    ShardDims d;
++    d.hidden = 7168;
++    const ShardError e = moe_all_expert_width_dims(
++        spec.n_experts, spec.moe_ffn, spec.world_size, spec.rank,
++        spec.expert_block_elems, &d);
++    if (!e.ok()) return e;
++    *out = d;
++    return ShardError{};
++}
++
++bool encode_message(const Message& m, std::vector<std::uint8_t>* frame,
++                    std::string* error) {
++    if (!frame) { set_error(error, "encode_message: null output"); return false; }
++    const std::uint16_t type = static_cast<std::uint16_t>(m.type);
++    const std::uint16_t phase = static_cast<std::uint16_t>(m.phase);
++    if (!valid_type(type)) { set_error(error, "unknown message type"); return false; }
++    if (!valid_phase(phase)) { set_error(error, "unknown protocol phase"); return false; }
++    if (m.detail.size() > kMaxDetailBytes) {
++        set_error(error, "diagnostic detail exceeds protocol bound");
++        return false;
++    }
++
++    std::vector<std::uint8_t> payload;
++    payload.reserve(kWireFixedPayloadBytes + m.detail.size());
++    put_u64(payload, m.session_id);
++    put_u64(payload, m.sequence);
++    put_i32(payload, m.rank);
++    put_i32(payload, m.world_size);
++    put_i32(payload, m.local_device);
++    put_i32(payload, m.n_experts);
++    put_i32(payload, m.moe_ffn);
++    put_i32(payload, m.expert_block_elems);
++    put_i32(payload, m.vocab);
++    put_i32(payload, m.token_id);
++    put_i32(payload, m.status);
++    put_u16(payload, phase);
++    put_u16(payload, 0);  // reserved; must decode as zero
++    payload.insert(payload.end(), m.model_digest.begin(), m.model_digest.end());
++    payload.insert(payload.end(), m.plan_digest.begin(), m.plan_digest.end());
++    payload.insert(payload.end(), m.nccl_id.begin(), m.nccl_id.end());
++    put_u16(payload, static_cast<std::uint16_t>(m.detail.size()));
++    payload.insert(payload.end(), m.detail.begin(), m.detail.end());
++
++    frame->clear();
++    if (payload.size() < kWireFixedPayloadBytes || payload.size() > kMaxPayloadBytes) {
++        set_error(error, "internal payload length outside protocol bounds");
++        return false;
++    }
++    frame->reserve(kWireHeaderBytes + payload.size());
++    put_u32(*frame, kMagic);
++    put_u16(*frame, kProtocolVersion);
++    put_u16(*frame, type);
++    put_u32(*frame, static_cast<std::uint32_t>(payload.size()));
++    put_u32(*frame, crc32(payload.data(), payload.size()));
++    frame->insert(frame->end(), payload.begin(), payload.end());
++    return true;
++}
++
++bool decode_message(const std::uint8_t* frame, std::size_t size, Message* message,
++                    std::string* error) {
++    if (!frame || !message) { set_error(error, "decode_message: null input/output"); return false; }
++    if (size < kWireHeaderBytes) { set_error(error, "truncated frame header"); return false; }
++    Reader h{frame, kWireHeaderBytes, 0};
++    std::uint32_t magic = 0, payload_size = 0, checksum = 0;
++    std::uint16_t version = 0, type = 0;
++    if (!h.u32(&magic) || !h.u16(&version) || !h.u16(&type) ||
++        !h.u32(&payload_size) || !h.u32(&checksum)) {
++        set_error(error, "invalid frame header"); return false;
++    }
++    if (magic != kMagic) { set_error(error, "bad frame magic"); return false; }
++    if (version != kProtocolVersion) { set_error(error, "unsupported protocol version"); return false; }
++    if (!valid_type(type)) { set_error(error, "unknown message type"); return false; }
++    if (payload_size < kWireFixedPayloadBytes || payload_size > kMaxPayloadBytes) {
++        set_error(error, "payload length outside protocol bounds");
++        return false;
++    }
++    if (size != kWireHeaderBytes + static_cast<std::size_t>(payload_size)) {
++        set_error(error, "frame length mismatch");
++        return false;
++    }
++    const std::uint8_t* payload = frame + kWireHeaderBytes;
++    if (crc32(payload, payload_size) != checksum) { set_error(error, "payload CRC mismatch"); return false; }
++
++    Reader r{payload, payload_size, 0};
++    Message m;
++    m.type = static_cast<MessageType>(type);
++    std::uint16_t phase = 0, reserved = 0, detail_size = 0;
++    if (!r.u64(&m.session_id) || !r.u64(&m.sequence) ||
++        !r.i32(&m.rank) || !r.i32(&m.world_size) || !r.i32(&m.local_device) ||
++        !r.i32(&m.n_experts) || !r.i32(&m.moe_ffn) ||
++        !r.i32(&m.expert_block_elems) || !r.i32(&m.vocab) ||
++        !r.i32(&m.token_id) || !r.i32(&m.status) ||
++        !r.u16(&phase) || !r.u16(&reserved) ||
++        !r.bytes(m.model_digest.data(), m.model_digest.size()) ||
++        !r.bytes(m.plan_digest.data(), m.plan_digest.size()) ||
++        !r.bytes(m.nccl_id.data(), m.nccl_id.size()) ||
++        !r.u16(&detail_size)) {
++        set_error(error, "truncated message payload"); return false;
++    }
++    if (!valid_phase(phase)) { set_error(error, "unknown protocol phase"); return false; }
++    if (reserved != 0) { set_error(error, "nonzero reserved field"); return false; }
++    if (detail_size > kMaxDetailBytes || r.at + detail_size != r.size) {
++        set_error(error, "invalid diagnostic detail length"); return false;
++    }
++    m.phase = static_cast<Phase>(phase);
++    m.detail.assign(reinterpret_cast<const char*>(r.data + r.at), detail_size);
++    r.at += detail_size;
++    *message = std::move(m);
++    return true;
++}
++
++Coordinator::Coordinator(const RankSpec& cluster) : cluster_(cluster) {
++    ShardDims d;
++    const ShardError e = validate_rank_spec(cluster_, &d);
++    if (!e.ok()) {
++        state_ = CoordinatorState::Failed;
++        failure_ = e.message;
++        return;
++    }
++    if (cluster_.rank != 0) {
++        state_ = CoordinatorState::Failed;
++        failure_ = "coordinator must use global rank 0";
++        return;
++    }
++    hello_.assign(cluster_.world_size, 0);
++    nccl_ready_.assign(cluster_.world_size, 0);
++    load_ready_.assign(cluster_.world_size, 0);
++    step_done_.assign(cluster_.world_size, 0);
++    finish_ack_.assign(cluster_.world_size, 0);
++    peer_connection_.assign(cluster_.world_size, 0);
++}
++
++bool Coordinator::matches_cluster(const Message& m, std::string* why) const {
++    if (m.session_id != cluster_.session_id) { set_error(why, "session mismatch"); return false; }
++    if (m.world_size != cluster_.world_size) { set_error(why, "world-size mismatch"); return false; }
++    if (m.rank < 0 || m.rank >= cluster_.world_size) { set_error(why, "rank out of range"); return false; }
++    if (m.local_device != 0) { set_error(why, "rank-local device must be 0"); return false; }
++    if (m.n_experts != cluster_.n_experts || m.moe_ffn != cluster_.moe_ffn ||
++        m.expert_block_elems != cluster_.expert_block_elems || m.vocab != cluster_.vocab) {
++        set_error(why, "model/plan shape mismatch"); return false;
++    }
++    if (m.model_digest != cluster_.model_digest) { set_error(why, "model digest mismatch"); return false; }
++    if (m.plan_digest != cluster_.plan_digest) { set_error(why, "plan digest mismatch"); return false; }
++    return true;
++}
++
++Message Coordinator::control(MessageType type, int target) const {
++    Message m = from_spec(cluster_, type, target);
++    m.sequence = next_sequence_;
++    return m;
++}
++
++bool Coordinator::abort_cluster(Phase phase, int status, const std::string& detail,
++                                std::vector<Message>* outbound, std::string* error) {
++    if (state_ == CoordinatorState::Failed) {
++        set_error(error, failure_);
++        return false;
++    }
++    if (state_ == CoordinatorState::Finished) {
++        set_error(error, "cluster already finished");
++        return false;
++    }
++    if (!outbound) {
++        set_error(error, "cluster abort requires an outbound sink");
++        return false;
++    }
++    failure_ = detail.empty() ? "cluster aborted" : detail;
++    state_ = CoordinatorState::Failed;
++    for (int rank = 0; rank < cluster_.world_size; ++rank) {
++        Message m = control(MessageType::Abort, rank);
++        m.phase = phase;
++        m.status = status == 0 ? -1 : status;
++        m.detail = failure_.substr(0, kMaxDetailBytes);
++        outbound->push_back(std::move(m));
++    }
++    set_error(error, failure_);
++    return false;
++}
++
++bool Coordinator::accept(const AuthenticatedPeer& peer, const Message& m,
++                         std::vector<Message>* outbound,
++                         std::string* error) {
++    if (state_ == CoordinatorState::Failed) { set_error(error, failure_); return false; }
++    if (state_ == CoordinatorState::Finished) {
++        set_error(error, "cluster already finished");
++        return false;
++    }
++    if (!outbound) {
++        set_error(error, "Coordinator::accept requires an outbound sink");
++        return false;
++    }
++    if (peer.rank < 0 || peer.rank >= cluster_.world_size)
++        return abort_cluster(coordinator_phase(state_), -17,
++                             "authenticated peer rank out of range", outbound, error);
++    if (peer.connection_id == 0)
++        return abort_cluster(coordinator_phase(state_), -23,
++                             "authenticated connection id is unset", outbound, error);
++    if (m.rank != peer.rank)
++        return abort_cluster(coordinator_phase(state_), -18,
++                             "transport peer rank does not match Message::rank",
++                             outbound, error);
++    std::string why;
++    if (!matches_cluster(m, &why))
++        return abort_cluster(coordinator_phase(state_), -2, why, outbound, error);
++
++    const std::uint64_t bound_connection = peer_connection_[peer.rank];
++    if (bound_connection != 0 && bound_connection != peer.connection_id)
++        return abort_cluster(coordinator_phase(state_), -24,
++                             "duplicate connection for authenticated rank",
++                             outbound, error);
++    if (m.type != MessageType::Hello && bound_connection == 0)
++        return abort_cluster(coordinator_phase(state_), -25,
++                             "rank message received before bound Hello",
++                             outbound, error);
++
++    if (m.type == MessageType::Failure) {
++        if (m.status == 0 || m.phase == Phase::None)
++            return abort_cluster(coordinator_phase(state_), -26,
++                                 "invalid Failure report", outbound, error);
++        return abort_cluster(m.phase, m.status, m.detail, outbound, error);
++    }
++
++    switch (m.type) {
++        case MessageType::Hello:
++            if (state_ != CoordinatorState::CollectingHello || m.sequence != 0 ||
++                m.phase != Phase::Bootstrap)
++                return abort_cluster(Phase::Bootstrap, -3, "unexpected Hello", outbound, error);
++            if (hello_[m.rank])
++                return abort_cluster(Phase::Bootstrap, -4, "duplicate Hello", outbound, error);
++            peer_connection_[m.rank] = peer.connection_id;
++            hello_[m.rank] = 1;
++            if (all_seen(hello_)) state_ = CoordinatorState::AwaitingNcclUniqueId;
++            return true;
++
++        case MessageType::NcclReady:
++            if (state_ != CoordinatorState::WaitingNcclReady || m.sequence != 0 ||
++                m.status != 0 || m.phase != Phase::NcclInit)
++                return abort_cluster(Phase::NcclInit, -5, "unexpected NcclReady", outbound, error);
++            if (nccl_ready_[m.rank])
++                return abort_cluster(Phase::NcclInit, -6, "duplicate NcclReady", outbound, error);
++            nccl_ready_[m.rank] = 1;
++            if (all_seen(nccl_ready_)) {
++                state_ = CoordinatorState::WaitingLoadReady;
++                for (int rank = 0; rank < cluster_.world_size; ++rank) {
++                    Message begin = control(MessageType::BeginLoad, rank);
++                    begin.phase = Phase::Load;
++                    outbound->push_back(std::move(begin));
++                }
++            }
++            return true;
++
++        case MessageType::LoadReady:
++            if (state_ != CoordinatorState::WaitingLoadReady || m.sequence != 0 ||
++                m.status != 0 || m.phase != Phase::Load)
++                return abort_cluster(Phase::Load, -7, "unexpected LoadReady", outbound, error);
++            if (load_ready_[m.rank])
++                return abort_cluster(Phase::Load, -8, "duplicate LoadReady", outbound, error);
++            load_ready_[m.rank] = 1;
++            if (all_seen(load_ready_)) state_ = CoordinatorState::Ready;
++            return true;
++
++        case MessageType::StepDone:
++            if (state_ != CoordinatorState::StepInFlight ||
++                m.sequence != next_sequence_ || m.status != 0 || m.phase != Phase::Step)
++                return abort_cluster(Phase::Step, -9, "unexpected StepDone", outbound, error);
++            if (step_done_[m.rank])
++                return abort_cluster(Phase::Step, -10, "duplicate StepDone", outbound, error);
++            step_done_[m.rank] = 1;
++            if (all_seen(step_done_)) {
++                ++next_sequence_;
++                state_ = CoordinatorState::Ready;
++            }
++            return true;
++
++        case MessageType::FinishAck:
++            if (state_ != CoordinatorState::WaitingFinishAck ||
++                m.sequence != next_sequence_ || m.status != 0 ||
++                m.phase != Phase::Shutdown)
++                return abort_cluster(Phase::Shutdown, -19,
++                                     "unexpected FinishAck", outbound, error);
++            if (finish_ack_[m.rank])
++                return abort_cluster(Phase::Shutdown, -20,
++                                     "duplicate FinishAck", outbound, error);
++            finish_ack_[m.rank] = 1;
++            if (all_seen(finish_ack_)) state_ = CoordinatorState::Finished;
++            return true;
++
++        default:
++            return abort_cluster(coordinator_phase(state_), -11,
++                                 "unexpected rank message type", outbound, error);
++    }
++}
++
++bool Coordinator::install_nccl_unique_id(const NcclUniqueId& id,
++                                         std::vector<Message>* outbound,
++                                         std::string* error) {
++    if (state_ != CoordinatorState::AwaitingNcclUniqueId) {
++        if (state_ == CoordinatorState::Failed) { set_error(error, failure_); return false; }
++        return abort_cluster(Phase::Bootstrap, -12, "NCCL id installed out of order",
++                             outbound, error);
++    }
++    if (!outbound) return abort_cluster(Phase::Bootstrap, -13,
++                                        "NCCL id has no outbound sink", outbound, error);
++    if (!any_nonzero(id))
++        return abort_cluster(Phase::Bootstrap, -27,
++                             "NCCL unique id is unset", outbound, error);
++    for (int rank = 0; rank < cluster_.world_size; ++rank) {
++        Message m = control(MessageType::NcclUniqueId, rank);
++        m.phase = Phase::NcclInit;
++        m.nccl_id = id;
++        outbound->push_back(std::move(m));
++    }
++    state_ = CoordinatorState::WaitingNcclReady;
++    return true;
++}
++
++bool Coordinator::begin_step(int token_id, std::vector<Message>* outbound,
++                             std::string* error) {
++    if (state_ != CoordinatorState::Ready) {
++        if (state_ == CoordinatorState::Failed) { set_error(error, failure_); return false; }
++        if (state_ == CoordinatorState::Finished) {
++            set_error(error, "cluster already finished");
++            return false;
++        }
++        return abort_cluster(Phase::Step, -14, "token started before cluster Ready",
++                             outbound, error);
++    }
++    if (!outbound) return abort_cluster(Phase::Step, -15,
++                                        "token broadcast has no outbound sink", outbound, error);
++    if (token_id < 0 || token_id >= cluster_.vocab)
++        return abort_cluster(Phase::Step, -16, "token id outside vocabulary", outbound, error);
++    std::fill(step_done_.begin(), step_done_.end(), 0);
++    for (int rank = 0; rank < cluster_.world_size; ++rank) {
++        Message m = control(MessageType::Token, rank);
++        m.phase = Phase::Step;
++        m.token_id = token_id;
++        outbound->push_back(std::move(m));
++    }
++    state_ = CoordinatorState::StepInFlight;
++    return true;
++}
++
++bool Coordinator::finish(std::vector<Message>* outbound, std::string* error) {
++    if (state_ != CoordinatorState::Ready) {
++        if (state_ == CoordinatorState::Failed) { set_error(error, failure_); return false; }
++        if (state_ == CoordinatorState::Finished) {
++            set_error(error, "cluster already finished");
++            return false;
++        }
++        return abort_cluster(Phase::Shutdown, -21,
++                             "Finish sent before cluster Ready", outbound, error);
++    }
++    if (!outbound)
++        return abort_cluster(Phase::Shutdown, -22,
++                             "Finish has no outbound sink", outbound, error);
++    std::fill(finish_ack_.begin(), finish_ack_.end(), 0);
++    for (int rank = 0; rank < cluster_.world_size; ++rank) {
++        Message m = control(MessageType::Finish, rank);
++        m.phase = Phase::Shutdown;
++        outbound->push_back(std::move(m));
++    }
++    state_ = CoordinatorState::WaitingFinishAck;
++    return true;
++}
++
++bool Coordinator::fail(Phase phase, int status, const std::string& detail,
++                       std::vector<Message>* outbound, std::string* error) {
++    if (state_ == CoordinatorState::Finished) {
++        set_error(error, "cluster already finished");
++        return false;
++    }
++    return abort_cluster(phase, status, detail, outbound, error);
++}
++
++RankSession::RankSession(const RankSpec& spec) : spec_(spec) {
++    ShardDims d;
++    const ShardError e = validate_rank_spec(spec_, &d);
++    if (!e.ok()) {
++        state_ = RankState::Failed;
++        failure_ = e.message;
++    }
++}
++
++Message RankSession::reply(MessageType type, Phase phase) const {
++    Message m = from_spec(spec_, type, spec_.rank);
++    m.sequence = next_sequence_;
++    m.phase = phase;
++    return m;
++}
++
++bool RankSession::reject(const std::string& detail, std::string* error) {
++    if (failure_.empty()) failure_ = detail;
++    state_ = RankState::Failed;
++    set_error(error, failure_);
++    return false;
++}
++
++bool RankSession::hello(Message* outbound, std::string* error) {
++    if (!outbound) return reject("Hello has no outbound sink", error);
++    if (state_ != RankState::Created) return reject("Hello sent out of order", error);
++    *outbound = reply(MessageType::Hello, Phase::Bootstrap);
++    outbound->sequence = 0;
++    state_ = RankState::HelloSent;
++    return true;
++}
++
++bool RankSession::accept_control(const Message& m, int* token_id, std::string* error) {
++    if (m.session_id != spec_.session_id || m.world_size != spec_.world_size ||
++        m.rank != spec_.rank || m.local_device != spec_.local_device ||
++        m.n_experts != spec_.n_experts || m.moe_ffn != spec_.moe_ffn ||
++        m.expert_block_elems != spec_.expert_block_elems || m.vocab != spec_.vocab ||
++        m.model_digest != spec_.model_digest || m.plan_digest != spec_.plan_digest)
++        return reject("control message cluster identity mismatch", error);
++
++    // Abort is deliberately idempotent and must remain consumable after a local
++    // failure so the dedicated control thread can still call ncclCommAbort. Keep
++    // the more specific local failure text when one already exists.
++    if (m.type == MessageType::Abort) {
++        if (m.status == 0 || m.phase == Phase::None)
++            return reject("malformed coordinator Abort", error);
++        if (failure_.empty())
++            failure_ = m.detail.empty() ? "coordinator aborted cluster" : m.detail;
++        state_ = RankState::Failed;
++        return true;
++    }
++    if (state_ == RankState::Failed) { set_error(error, failure_); return false; }
++    if (state_ == RankState::Finished) {
++        set_error(error, "rank already finished");
++        return false;
++    }
++
++    switch (m.type) {
++        case MessageType::NcclUniqueId:
++            if (state_ != RankState::HelloSent || m.sequence != 0 ||
++                m.phase != Phase::NcclInit || m.status != 0)
++                return reject("NCCL id received out of order", error);
++            if (!any_nonzero(m.nccl_id))
++                return reject("NCCL unique id is unset", error);
++            nccl_id_ = m.nccl_id;
++            state_ = RankState::NeedNcclInit;
++            return true;
++
++        case MessageType::BeginLoad:
++            if (state_ != RankState::NcclReadySent || m.sequence != 0 ||
++                m.phase != Phase::Load || m.status != 0)
++                return reject("BeginLoad received before NCCL ready", error);
++            state_ = RankState::Loading;
++            return true;
++
++        case MessageType::Token:
++            if (state_ != RankState::WaitingToken)
++                return reject("Token received before rank ready or while step running", error);
++            if (m.sequence != next_sequence_)
++                return reject("Token sequence gap/replay", error);
++            if (m.phase != Phase::Step)
++                return reject("Token carries the wrong protocol phase", error);
++            if (m.status != 0)
++                return reject("Token carries a nonzero status", error);
++            if (m.token_id < 0 || m.token_id >= spec_.vocab)
++                return reject("Token id outside vocabulary", error);
++            if (!token_id) return reject("Token has no output sink", error);
++            *token_id = m.token_id;
++            state_ = RankState::StepRunning;
++            return true;
++
++        case MessageType::Finish:
++            if (state_ != RankState::WaitingToken ||
++                m.sequence != next_sequence_ || m.phase != Phase::Shutdown ||
++                m.status != 0)
++                return reject("Finish received out of order", error);
++            state_ = RankState::FinishPending;
++            return true;
++
++        default:
++            return reject("unexpected coordinator message type", error);
++    }
++}
++
++bool RankSession::report_nccl_ready(bool success, int status, const std::string& detail,
++                                    Message* outbound, std::string* error) {
++    if (!outbound) return reject("NCCL result has no outbound sink", error);
++    if (state_ != RankState::NeedNcclInit)
++        return reject("NCCL result reported out of order", error);
++    *outbound = reply(success ? MessageType::NcclReady : MessageType::Failure,
++                      Phase::NcclInit);
++    outbound->sequence = 0;
++    outbound->status = success ? 0 : (status == 0 ? -1 : status);
++    outbound->detail = success
++        ? detail.substr(0, kMaxDetailBytes)
++        : (detail.empty() ? "NCCL initialization failed" : detail).substr(0, kMaxDetailBytes);
++    if (success) state_ = RankState::NcclReadySent;
++    else { state_ = RankState::Failed; failure_ = outbound->detail; }
++    return true;
++}
++
++bool RankSession::report_load_ready(bool success, int status, const std::string& detail,
++                                    Message* outbound, std::string* error) {
++    if (!outbound) return reject("load result has no outbound sink", error);
++    if (state_ != RankState::Loading)
++        return reject("load result reported out of order", error);
++    *outbound = reply(success ? MessageType::LoadReady : MessageType::Failure, Phase::Load);
++    outbound->sequence = 0;
++    outbound->status = success ? 0 : (status == 0 ? -1 : status);
++    outbound->detail = success
++        ? detail.substr(0, kMaxDetailBytes)
++        : (detail.empty() ? "rank-local model load failed" : detail).substr(0, kMaxDetailBytes);
++    if (success) state_ = RankState::WaitingToken;
++    else { state_ = RankState::Failed; failure_ = outbound->detail; }
++    return true;
++}
++
++bool RankSession::report_step_done(bool success, int status, const std::string& detail,
++                                   Message* outbound, std::string* error) {
++    if (!outbound) return reject("step result has no outbound sink", error);
++    if (state_ != RankState::StepRunning)
++        return reject("step result reported out of order", error);
++    *outbound = reply(success ? MessageType::StepDone : MessageType::Failure, Phase::Step);
++    outbound->status = success ? 0 : (status == 0 ? -1 : status);
++    outbound->detail = success
++        ? detail.substr(0, kMaxDetailBytes)
++        : (detail.empty() ? "rank-local forward step failed" : detail).substr(0, kMaxDetailBytes);
++    if (success) {
++        ++next_sequence_;
++        state_ = RankState::WaitingToken;
++    } else {
++        state_ = RankState::Failed;
++        failure_ = outbound->detail;
++    }
++    return true;
++}
++
++bool RankSession::report_finish_ack(Message* outbound, std::string* error) {
++    if (!outbound) return reject("FinishAck has no outbound sink", error);
++    if (state_ != RankState::FinishPending)
++        return reject("FinishAck reported out of order", error);
++    *outbound = reply(MessageType::FinishAck, Phase::Shutdown);
++    outbound->status = 0;
++    state_ = RankState::Finished;
++    return true;
++}
++
++bool RankSession::failure_message(Phase phase, int status, Message* outbound,
++                                  std::string* error) const {
++    if (!outbound) { set_error(error, "failure message has no outbound sink"); return false; }
++    if (state_ != RankState::Failed || failure_.empty()) {
++        set_error(error, "rank has no sticky failure to report");
++        return false;
++    }
++    *outbound = reply(MessageType::Failure, phase);
++    outbound->status = status == 0 ? -1 : status;
++    outbound->detail = failure_.substr(0, kMaxDetailBytes);
++    return true;
++}
++
++}  // namespace dist
++}  // namespace tp
++}  // namespace sparkinfer
+diff --git a/runtime/tests/CMakeLists.txt b/runtime/tests/CMakeLists.txt
+index f122fbc..cdfd9e9 100644
+--- a/runtime/tests/CMakeLists.txt
++++ b/runtime/tests/CMakeLists.txt
+@@ -99,6 +99,14 @@ set_target_properties(tp3_all_expert_width_cpu_test PROPERTIES CXX_STANDARD 17)
+ target_include_directories(tp3_all_expert_width_cpu_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+ add_test(NAME tp3_all_expert_width_cpu_test COMMAND tp3_all_expert_width_cpu_test)
+ 
++# Distributed three-Spark control plane: portable wire framing and state machines
++# only. No socket, CUDA, or NCCL implementation is linked by this test.
++add_executable(tp3_rank_protocol_cpu_test tp3_rank_protocol_cpu_test.cpp
++               ../src/tp/rank_protocol.cpp ../src/tp/weight_plan.cpp
++               ../src/tp/shard.cpp)
++set_target_properties(tp3_rank_protocol_cpu_test PROPERTIES CXX_STANDARD 17)
++add_test(NAME tp3_rank_protocol_cpu_test COMMAND tp3_rank_protocol_cpu_test)
++
+ # The K3 decode schedule: op order, widths, and collective placement as DATA, so the
+ # properties that would otherwise only show up as degraded output are assertable
+ # without a GPU. Strongest check inside is the plan/manifest cross-check — two tensor
+diff --git a/runtime/tests/tp3_rank_protocol_cpu_test.cpp b/runtime/tests/tp3_rank_protocol_cpu_test.cpp
+new file mode 100644
+index 0000000..9cc05e2
+--- /dev/null
++++ b/runtime/tests/tp3_rank_protocol_cpu_test.cpp
+@@ -0,0 +1,510 @@
++// CPU-only distributed control-plane tests for one K3 TP rank per DGX Spark.
++
++#include "sparkinfer/tp/rank_protocol.h"
++#include "sparkinfer/tp/weight_plan.h"
++
++#include <cstdio>
++#include <string>
++#include <vector>
++
++using namespace sparkinfer::tp;
++using namespace sparkinfer::tp::dist;
++
++static int g_checks = 0;
++static int g_failures = 0;
++
++#define CHECK(cond, ...)                                                          \
++    do {                                                                          \
++        ++g_checks;                                                               \
++        if (!(cond)) {                                                            \
++            ++g_failures;                                                         \
++            std::printf("FAIL %s:%d: ", __FILE__, __LINE__);                    \
++            std::printf(__VA_ARGS__);                                             \
++            std::printf("\n");                                                   \
++        }                                                                         \
++    } while (0)
++
++#define CHECK_EQ(a, b) CHECK((long long)(a) == (long long)(b),                    \
++                             "got %lld want %lld",                               \
++                             (long long)(a), (long long)(b))
++
++static RankSpec spec_for(int rank) {
++    RankSpec s;
++    s.session_id = 0x1122334455667788ULL;
++    s.rank = rank;
++    s.vocab = 163840;
++    for (std::size_t i = 0; i < s.model_digest.size(); ++i) {
++        s.model_digest[i] = static_cast<std::uint8_t>(i + 1);
++        s.plan_digest[i] = static_cast<std::uint8_t>(0xf0U - i);
++    }
++    return s;
++}
++
++static AuthenticatedPeer peer_for(int rank, std::uint64_t generation = 0) {
++    AuthenticatedPeer peer;
++    peer.rank = rank;
++    peer.connection_id = 0xc0010000ULL +
++                         static_cast<std::uint64_t>(rank) + generation * 16ULL;
++    return peer;
++}
++
++static bool same_message(const Message& a, const Message& b) {
++    return a.type == b.type && a.session_id == b.session_id &&
++           a.sequence == b.sequence && a.rank == b.rank &&
++           a.world_size == b.world_size && a.local_device == b.local_device &&
++           a.n_experts == b.n_experts && a.moe_ffn == b.moe_ffn &&
++           a.expert_block_elems == b.expert_block_elems && a.vocab == b.vocab &&
++           a.token_id == b.token_id && a.status == b.status && a.phase == b.phase &&
++           a.model_digest == b.model_digest && a.plan_digest == b.plan_digest &&
++           a.nccl_id == b.nccl_id && a.detail == b.detail;
++}
++
++static Message wire(const Message& in) {
++    std::vector<std::uint8_t> bytes;
++    std::string error;
++    CHECK(encode_message(in, &bytes, &error), "encode failed: %s", error.c_str());
++    Message out;
++    CHECK(decode_message(bytes.data(), bytes.size(), &out, &error),
++          "decode failed: %s", error.c_str());
++    CHECK(same_message(in, out), "wire round trip changed message");
++    return out;
++}
++
++struct Harness {
++    RankSpec cluster;
++    Coordinator coordinator;
++    std::vector<RankSession> ranks;
++
++    Harness() : cluster(spec_for(0)), coordinator(cluster) {
++        for (int rank = 0; rank < 3; ++rank) ranks.emplace_back(spec_for(rank));
++    }
++
++    bool bring_ready() {
++        std::vector<Message> out;
++        std::string error;
++        for (int rank = 0; rank < 3; ++rank) {
++            Message hello;
++            if (!ranks[rank].hello(&hello, &error)) return false;
++            if (!coordinator.accept(peer_for(rank), wire(hello), &out, &error)) return false;
++        }
++        if (coordinator.state() != CoordinatorState::AwaitingNcclUniqueId) return false;
++
++        NcclUniqueId id{};
++        for (std::size_t i = 0; i < id.size(); ++i)
++            id[i] = static_cast<std::uint8_t>(i ^ 0xa5U);
++        if (!coordinator.install_nccl_unique_id(id, &out, &error)) return false;
++        if (out.size() != 3) return false;
++        for (const Message& control : out) {
++            const Message m = wire(control);
++            if (!ranks[m.rank].accept_control(m, nullptr, &error)) return false;
++            if (ranks[m.rank].nccl_unique_id() != id) return false;
++        }
++        out.clear();
++
++        for (int rank = 0; rank < 3; ++rank) {
++            Message ready;
++            if (!ranks[rank].report_nccl_ready(true, 0, "", &ready, &error)) return false;
++            if (!coordinator.accept(peer_for(rank), wire(ready), &out, &error)) return false;
++        }
++        if (out.size() != 3 || coordinator.state() != CoordinatorState::WaitingLoadReady)
++            return false;
++        for (const Message& control : out) {
++            const Message m = wire(control);
++            if (!ranks[m.rank].accept_control(m, nullptr, &error)) return false;
++        }
++        out.clear();
++
++        for (int rank = 0; rank < 3; ++rank) {
++            Message ready;
++            if (!ranks[rank].report_load_ready(true, 0, "", &ready, &error)) return false;
++            if (!coordinator.accept(peer_for(rank), wire(ready), &out, &error)) return false;
++        }
++        return coordinator.state() == CoordinatorState::Ready;
++    }
++};
++
++static void test_rank_plan_is_exact() {
++    std::printf("rank_plan_is_exact\n");
++    int next = 0;
++    for (int rank = 0; rank < 3; ++rank) {
++        ShardDims d;
++        const ShardError e = validate_rank_spec(spec_for(rank), &d);
++        CHECK(e.ok(), "rank %d: %s", rank, e.message.c_str());
++        CHECK(d.moe_shard_mode == MoeShardMode::AllExpertsFfnWidth,
++              "rank %d wrong mode", rank);
++        CHECK_EQ(d.expert_band.offset, 0);
++        CHECK_EQ(d.expert_band.extent, 896);
++        CHECK_EQ(d.n_experts, 896);
++        CHECK_EQ(d.moe_ffn_band.offset, next);
++        CHECK_EQ(d.moe_ffn_band.extent, 512);
++        CHECK_EQ(d.moe_ffn_band.offset % 256, 0);
++        CHECK_EQ(d.moe_ffn_band.extent % 256, 0);
++        const TensorPlan gate = plan_for("blk.1.ffn_gate_exps.weight", 1536, 3584, d);
++        const TensorPlan up = plan_for("blk.1.ffn_up_exps.weight", 1536, 3584, d);
++        const TensorPlan down = plan_for("blk.1.ffn_down_exps.weight", 3584, 1536, d);
++        CHECK(gate.rule == Rule::ExpertRow2D && up.rule == Rule::ExpertRow2D,
++              "rank %d gate/up must split ne1", rank);
++        CHECK(down.rule == Rule::ExpertCol2D,
++              "rank %d down must split ne0", rank);
++        CHECK_EQ(gate.rows, 512);
++        CHECK_EQ(up.rows, 512);
++        CHECK_EQ(down.cols, 512);
++        CHECK_EQ(gate.experts.extent, 896);
++        CHECK_EQ(up.experts.extent, 896);
++        CHECK_EQ(down.experts.extent, 896);
++        next = d.moe_ffn_band.end();
++    }
++    CHECK_EQ(next, 1536);
++}
++
++static void test_wire_contract_and_corruption() {
++    std::printf("wire_contract_and_corruption\n");
++    RankSession rank(spec_for(1));
++    Message hello;
++    std::string error;
++    CHECK(rank.hello(&hello, &error), "hello: %s", error.c_str());
++    hello.detail = "bounded diagnostic";
++    hello.status = -123;  // signed wire field must round-trip portably
++    const Message decoded = wire(hello);
++    CHECK(same_message(hello, decoded), "hello wire mismatch");
++
++    std::vector<std::uint8_t> bytes;
++    CHECK(encode_message(hello, &bytes, &error), "encode: %s", error.c_str());
++    CHECK_EQ(bytes.size(), kWireHeaderBytes + kWireFixedPayloadBytes + hello.detail.size());
++    Message out;
++
++    std::vector<std::uint8_t> corrupt = bytes;
++    corrupt.back() ^= 0x1;
++    CHECK(!decode_message(corrupt.data(), corrupt.size(), &out, &error) &&
++              error.find("CRC") != std::string::npos,
++          "payload corruption must fail CRC: %s", error.c_str());
++    CHECK(!decode_message(bytes.data(), bytes.size() - 1, &out, &error),
++          "truncated frame must fail");
++
++    corrupt = bytes;
++    corrupt[0] ^= 0xff;
++    CHECK(!decode_message(corrupt.data(), corrupt.size(), &out, &error) &&
++              error.find("magic") != std::string::npos,
++          "bad magic must fail");
++    corrupt = bytes;
++    corrupt[4] = 2; corrupt[5] = 0;
++    CHECK(!decode_message(corrupt.data(), corrupt.size(), &out, &error) &&
++              error.find("version") != std::string::npos,
++          "bad version must fail");
++    corrupt = bytes;
++    corrupt[6] = 99; corrupt[7] = 0;
++    CHECK(!decode_message(corrupt.data(), corrupt.size(), &out, &error) &&
++              error.find("type") != std::string::npos,
++          "bad type must fail");
++
++    // The declared size is rejected before a transport would allocate it or CRC
++    // over it. Bytes 8..11 are the little-endian payload length field.
++    corrupt = bytes;
++    corrupt[8] = 0xff; corrupt[9] = 0xff;
++    corrupt[10] = 0xff; corrupt[11] = 0x7f;
++    CHECK(!decode_message(corrupt.data(), corrupt.size(), &out, &error) &&
++              error.find("bounds") != std::string::npos,
++          "unbounded payload declaration must fail before CRC: %s", error.c_str());
++
++    hello.detail.assign(kMaxDetailBytes + 1, 'x');
++    CHECK(!encode_message(hello, &bytes, &error) && error.find("bound") != std::string::npos,
++          "oversized detail must fail");
++    hello.detail.assign(kMaxDetailBytes, 'x');
++    CHECK(encode_message(hello, &bytes, &error), "maximum-size frame must encode");
++    CHECK_EQ(bytes.size(), kMaxFrameBytes);
++}
++
++static void test_full_bootstrap_load_and_two_steps() {
++    std::printf("full_bootstrap_load_and_two_steps\n");
++    Harness h;
++    CHECK(h.bring_ready(), "three-rank bootstrap/load did not reach Ready");
++    CHECK(h.coordinator.state() == CoordinatorState::Ready, "coordinator not ready");
++    for (int rank = 0; rank < 3; ++rank)
++        CHECK(h.ranks[rank].state() == RankState::WaitingToken,
++              "rank %d not waiting for token", rank);
++
++    for (int step = 0; step < 2; ++step) {
++        std::vector<Message> controls;
++        std::string error;
++        const int want_token = 420 + step;
++        CHECK(h.coordinator.begin_step(want_token, &controls, &error),
++              "begin step %d: %s", step, error.c_str());
++        CHECK_EQ(controls.size(), 3);
++        CHECK(h.coordinator.state() == CoordinatorState::StepInFlight,
++              "step %d not in flight", step);
++
++        std::vector<Message> done;
++        for (const Message& control : controls) {
++            const Message m = wire(control);
++            int got = -1;
++            CHECK(h.ranks[m.rank].accept_control(m, &got, &error),
++                  "rank %d token: %s", m.rank, error.c_str());
++            CHECK_EQ(got, want_token);
++            Message reply;
++            CHECK(h.ranks[m.rank].report_step_done(true, 0, "", &reply, &error),
++                  "rank %d done: %s", m.rank, error.c_str());
++            done.push_back(wire(reply));
++        }
++        controls.clear();
++        for (const Message& reply : done)
++            CHECK(h.coordinator.accept(peer_for(reply.rank), reply, &controls, &error),
++                  "StepDone: %s", error.c_str());
++        CHECK(h.coordinator.state() == CoordinatorState::Ready,
++              "step %d did not complete", step);
++        CHECK_EQ(h.coordinator.next_sequence(), step + 1);
++        for (int rank = 0; rank < 3; ++rank)
++            CHECK_EQ(h.ranks[rank].next_sequence(), step + 1);
++    }
++
++    std::vector<Message> controls;
++    std::string error;
++    CHECK(h.coordinator.finish(&controls, &error), "Finish: %s", error.c_str());
++    CHECK_EQ(controls.size(), 3);
++    CHECK(h.coordinator.state() == CoordinatorState::WaitingFinishAck,
++          "coordinator did not wait for FinishAck");
++    std::vector<Message> acknowledgements;
++    for (const Message& control : controls) {
++        const Message m = wire(control);
++        CHECK(h.ranks[m.rank].accept_control(m, nullptr, &error),
++              "rank %d Finish: %s", m.rank, error.c_str());
++        CHECK(h.ranks[m.rank].state() == RankState::FinishPending,
++              "rank %d did not enter FinishPending", m.rank);
++        Message ack;
++        CHECK(h.ranks[m.rank].report_finish_ack(&ack, &error),
++              "rank %d FinishAck: %s", m.rank, error.c_str());
++        CHECK(h.ranks[m.rank].state() == RankState::Finished,
++              "rank %d did not finish", m.rank);
++        acknowledgements.push_back(wire(ack));
++    }
++    controls.clear();
++    for (const Message& ack : acknowledgements)
++        CHECK(h.coordinator.accept(peer_for(ack.rank), ack, &controls, &error),
++              "coordinator FinishAck: %s", error.c_str());
++    CHECK(h.coordinator.state() == CoordinatorState::Finished,
++          "coordinator did not finish cleanly");
++    CHECK(!h.coordinator.begin_step(999, &controls, &error),
++          "finished coordinator accepted another token");
++    CHECK(controls.empty(), "finished coordinator emitted unexpected controls");
++}
++
++static void test_spec_and_bootstrap_refusals() {
++    std::printf("spec_and_bootstrap_refusals\n");
++    RankSpec bad = spec_for(0);
++    ShardDims d;
++    bad.world_size = 4;
++    CHECK(!validate_rank_spec(bad, &d).ok(), "world_size != 3 must fail");
++    bad = spec_for(0); bad.local_device = 1;
++    CHECK(!validate_rank_spec(bad, &d).ok(), "local device != 0 must fail");
++    bad = spec_for(0); bad.n_experts = 895;
++    CHECK(!validate_rank_spec(bad, &d).ok(), "missing expert identity must fail");
++    bad = spec_for(0); bad.moe_ffn = 3072;
++    CHECK(!validate_rank_spec(bad, &d).ok(), "wrong pruned width must fail");
++    bad = spec_for(0); bad.expert_block_elems = 128;
++    CHECK(!validate_rank_spec(bad, &d).ok(), "wrong quant block must fail");
++    bad = spec_for(0); bad.model_digest.fill(0);
++    CHECK(!validate_rank_spec(bad, &d).ok(), "unset model digest must fail");
++
++    Coordinator c(spec_for(0));
++    RankSession r(spec_for(0));
++    Message hello;
++    std::string error;
++    std::vector<Message> out;
++    CHECK(r.hello(&hello, &error), "hello");
++    CHECK(c.accept(peer_for(0), hello, &out, &error), "first hello: %s", error.c_str());
++    CHECK(!c.accept(peer_for(0), hello, &out, &error), "duplicate Hello must fail cluster");
++    CHECK(c.state() == CoordinatorState::Failed, "duplicate did not make failure sticky");
++    CHECK_EQ(out.size(), 3);
++    for (const Message& m : out) CHECK(m.type == MessageType::Abort, "expected Abort");
++
++    Coordinator duplicate_connection(spec_for(0));
++    RankSession connection_rank(spec_for(0));
++    CHECK(connection_rank.hello(&hello, &error), "connection-bound hello");
++    out.clear();
++    CHECK(duplicate_connection.accept(peer_for(0), hello, &out, &error),
++          "first rank connection must bind: %s", error.c_str());
++    CHECK(!duplicate_connection.accept(peer_for(0, 1), hello, &out, &error) &&
++              duplicate_connection.failure().find("duplicate connection") !=
++                  std::string::npos,
++          "second connection for one rank must abort");
++    CHECK_EQ(out.size(), 3);
++
++    Coordinator mismatch(spec_for(0));
++    RankSession r1(spec_for(1));
++    CHECK(r1.hello(&hello, &error), "hello rank1");
++    hello.plan_digest[0] ^= 1;
++    out.clear();
++    CHECK(!mismatch.accept(peer_for(1), hello, &out, &error) &&
++              mismatch.failure().find("digest") != std::string::npos,
++          "plan mismatch must abort");
++    CHECK_EQ(out.size(), 3);
++
++    Coordinator wrong_phase(spec_for(0));
++    RankSession phase_rank(spec_for(0));
++    CHECK(phase_rank.hello(&hello, &error), "phase hello");
++    hello.phase = Phase::Step;
++    out.clear();
++    CHECK(!wrong_phase.accept(peer_for(0), hello, &out, &error),
++          "Hello with the wrong phase must abort");
++    CHECK_EQ(out.size(), 3);
++
++    Coordinator bound_peer(spec_for(0));
++    RankSession claimed_rank(spec_for(1));
++    CHECK(claimed_rank.hello(&hello, &error), "bound-peer hello");
++    out.clear();
++    CHECK(!bound_peer.accept(peer_for(2), hello, &out, &error) &&
++              bound_peer.failure().find("transport peer rank") != std::string::npos,
++          "one authenticated connection must not impersonate another rank");
++    CHECK_EQ(out.size(), 3);
++
++    Coordinator no_sink(spec_for(0));
++    RankSession sink_rank(spec_for(0));
++    CHECK(sink_rank.hello(&hello, &error), "no-sink hello");
++    CHECK(!no_sink.accept(peer_for(0), hello, nullptr, &error),
++          "accept without outbound sink must fail closed");
++    CHECK(no_sink.state() == CoordinatorState::CollectingHello && no_sink.good(),
++          "missing sink must not commit a state transition");
++    out.clear();
++    CHECK(no_sink.accept(peer_for(0), hello, &out, &error),
++          "Hello must remain usable after sink refusal: %s", error.c_str());
++
++    RankSession bad_control(spec_for(0));
++    CHECK(bad_control.hello(&hello, &error), "bad-control hello");
++    hello.type = MessageType::NcclUniqueId;
++    hello.phase = Phase::Load;
++    CHECK(!bad_control.accept_control(hello, nullptr, &error),
++          "NCCL id with the wrong phase must fail rank");
++    CHECK(bad_control.state() == RankState::Failed,
++          "wrong control phase failure must be sticky");
++
++    RankSession zero_id_rank(spec_for(0));
++    CHECK(zero_id_rank.hello(&hello, &error), "zero-id hello");
++    hello.type = MessageType::NcclUniqueId;
++    hello.phase = Phase::NcclInit;
++    hello.status = 0;
++    hello.nccl_id.fill(0);
++    CHECK(!zero_id_rank.accept_control(hello, nullptr, &error) &&
++              error.find("unset") != std::string::npos,
++          "all-zero NCCL id must fail before communicator initialization");
++
++    Coordinator early(spec_for(0));
++    out.clear();
++    CHECK(!early.begin_step(42, &out, &error), "early token must abort");
++    CHECK_EQ(out.size(), 3);
++
++    Coordinator wrong_coordinator(spec_for(1));
++    CHECK(!wrong_coordinator.good() &&
++              wrong_coordinator.failure().find("rank 0") != std::string::npos,
++          "only global rank 0 may coordinate");
++}
++
++static void test_sequence_and_failure_propagation() {
++    std::printf("sequence_and_failure_propagation\n");
++    Harness replay;
++    CHECK(replay.bring_ready(), "replay harness ready");
++    std::vector<Message> controls;
++    std::string error;
++    CHECK(replay.coordinator.begin_step(7, &controls, &error), "begin replay step");
++    const Message token0 = wire(controls[0]);
++    int token = -1;
++    CHECK(replay.ranks[0].accept_control(token0, &token, &error), "first token");
++    CHECK(!replay.ranks[0].accept_control(token0, &token, &error),
++          "same token while running must fail rank");
++    CHECK(replay.ranks[0].state() == RankState::Failed, "replay failure not sticky");
++    Message replay_failure;
++    CHECK(replay.ranks[0].failure_message(Phase::Step, 409, &replay_failure, &error),
++          "sticky rank failure must be serializable: %s", error.c_str());
++    CHECK(replay_failure.type == MessageType::Failure && replay_failure.status == 409,
++          "serialized sticky failure lost type/status");
++
++    RankSession empty_detail(spec_for(0));
++    Message bootstrap;
++    CHECK(empty_detail.hello(&bootstrap, &error), "empty-detail Hello");
++    bootstrap.type = MessageType::NcclUniqueId;
++    bootstrap.phase = Phase::NcclInit;
++    bootstrap.nccl_id[0] = 1;
++    CHECK(empty_detail.accept_control(bootstrap, nullptr, &error),
++          "empty-detail rank accepts valid NCCL id");
++    Message empty_failure;
++    CHECK(empty_detail.report_nccl_ready(false, 91, "", &empty_failure, &error),
++          "empty detail must still produce Failure");
++    CHECK(!empty_detail.failure().empty() && !empty_failure.detail.empty(),
++          "failed rank must retain a retryable fallback detail");
++    CHECK(empty_detail.failure_message(Phase::NcclInit, 91, &empty_failure, &error),
++          "fallback failure must remain serializable");
++
++    Harness discarded_token;
++    CHECK(discarded_token.bring_ready(), "discarded-token harness ready");
++    controls.clear();
++    CHECK(discarded_token.coordinator.begin_step(17, &controls, &error),
++          "begin discarded-token step");
++    CHECK(!discarded_token.ranks[0].accept_control(controls[0], nullptr, &error) &&
++              error.find("output sink") != std::string::npos,
++          "Token must not advance when its value would be discarded");
++    CHECK(discarded_token.ranks[0].state() == RankState::Failed,
++          "discarded Token must fail the rank");
++
++    Harness failed;
++    CHECK(failed.bring_ready(), "failure harness ready");
++    controls.clear();
++    CHECK(failed.coordinator.begin_step(8, &controls, &error), "begin failure step");
++    for (const Message& control : controls) {
++        int got = -1;
++        CHECK(failed.ranks[control.rank].accept_control(control, &got, &error),
++              "route token rank %d", control.rank);
++    }
++    Message failure;
++    CHECK(failed.ranks[1].report_step_done(false, 77, "rank 1 kernel failure",
++                                           &failure, &error),
++          "rank failure report");
++    std::vector<Message> aborts;
++    CHECK(!failed.coordinator.accept(peer_for(failure.rank), wire(failure),
++                                     &aborts, &error),
++          "rank Failure must abort coordinator");
++    CHECK(failed.coordinator.state() == CoordinatorState::Failed,
++          "coordinator failure not sticky");
++    CHECK_EQ(aborts.size(), 3);
++    for (const Message& abort : aborts) {
++        CHECK(abort.type == MessageType::Abort, "failure propagation is not Abort");
++        CHECK(failed.ranks[abort.rank].accept_control(wire(abort), nullptr, &error),
++              "rank %d did not consume Abort", abort.rank);
++    }
++    CHECK(failed.ranks[1].failure() == "rank 1 kernel failure",
++          "coordinator Abort overwrote the rank's more specific local failure");
++    controls.clear();
++    CHECK(!failed.coordinator.begin_step(9, &controls, &error),
++          "failed coordinator must reject later work");
++    CHECK(controls.empty(), "sticky failure should not emit a second abort storm");
++
++    Harness timeout;
++    CHECK(timeout.bring_ready(), "timeout harness ready");
++    aborts.clear();
++    CHECK(!timeout.coordinator.fail(Phase::Step, 408, "step timeout", &aborts, &error),
++          "timeout should return operational failure");
++    CHECK_EQ(aborts.size(), 3);
++    CHECK(timeout.coordinator.failure() == "step timeout", "timeout detail lost");
++
++    Harness missing_sink;
++    CHECK(missing_sink.bring_ready(), "missing-sink harness ready");
++    CHECK(!missing_sink.coordinator.fail(Phase::Step, 500, "local failure",
++                                         nullptr, &error),
++          "failure without outbound sink must fail closed");
++    CHECK(missing_sink.coordinator.state() == CoordinatorState::Ready &&
++              missing_sink.coordinator.failure().empty(),
++          "missing Abort sink must not strand peers by committing Failed");
++    aborts.clear();
++    CHECK(!missing_sink.coordinator.fail(Phase::Step, 500, "local failure",
++                                         &aborts, &error),
++          "failure propagation returns false after emitting Abort");
++    CHECK_EQ(aborts.size(), 3);
++}
++
++int main() {
++    test_rank_plan_is_exact();
++    test_wire_contract_and_corruption();
++    test_full_bootstrap_load_and_two_steps();
++    test_spec_and_bootstrap_refusals();
++    test_sequence_and_failure_propagation();
++    std::printf("%s: %d checks, %d failures\n",
++                g_failures ? "FAIL" : "PASS", g_checks, g_failures);
++    return g_failures ? 1 : 0;
++}
+-- 
+2.43.0
+

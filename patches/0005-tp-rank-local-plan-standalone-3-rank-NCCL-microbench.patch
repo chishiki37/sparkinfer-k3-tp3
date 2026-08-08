@@ -1,0 +1,409 @@
+From 3d2365eca69ee1618af9566b542d16dd3ec4b865 Mon Sep 17 00:00:00 2001
+From: Hermes <hermes@local>
+Date: Fri, 7 Aug 2026 04:53:09 -0700
+Subject: [PATCH 05/12] tp: rank-local plan + standalone 3-rank NCCL microbench
+ skeleton
+
+---
+ runtime/examples/k3_dist_nccl_microbench.cpp  | 218 ++++++++++++++++++
+ .../include/sparkinfer/tp/rank_local_plan.h   |  35 +++
+ runtime/src/tp/rank_local_plan.cpp            |  61 +++++
+ runtime/tests/tp_rank_local_plan_cpu_test.cpp |  51 ++++
+ 4 files changed, 365 insertions(+)
+ create mode 100644 runtime/examples/k3_dist_nccl_microbench.cpp
+ create mode 100644 runtime/include/sparkinfer/tp/rank_local_plan.h
+ create mode 100644 runtime/src/tp/rank_local_plan.cpp
+ create mode 100644 runtime/tests/tp_rank_local_plan_cpu_test.cpp
+
+diff --git a/runtime/examples/k3_dist_nccl_microbench.cpp b/runtime/examples/k3_dist_nccl_microbench.cpp
+new file mode 100644
+index 0000000..b30b834
+--- /dev/null
++++ b/runtime/examples/k3_dist_nccl_microbench.cpp
+@@ -0,0 +1,218 @@
++// Multi-process NCCL InitRank microbench for 3-Spark-style ranks.
++//
++// One process per rank. On a single 3-GPU host (pod stand-in for 3 Sparks):
++//   CUDA_VISIBLE_DEVICES=0 ./k3_dist_nccl_microbench --rank 0 --world 3 --port 29500 &
++//   CUDA_VISIBLE_DEVICES=1 ./k3_dist_nccl_microbench --rank 1 --world 3 --port 29500 &
++//   CUDA_VISIBLE_DEVICES=2 ./k3_dist_nccl_microbench --rank 2 --world 3 --port 29500
++//
++// Rank 0 creates ncclUniqueId and serves it over TCP; others connect and join
++// ncclCommInitRank. Measures f32 all-reduce latency at K3 payload sizes
++// (7168 and 10752 floats = 28,672 / 43,008 bytes).
++//
++// Build (pod):
++//   g++ -O2 -std=c++17 k3_dist_nccl_microbench.cpp -o k3_dist_nccl_microbench \
++//       -I$CUDA_HOME/include -L$CUDA_HOME/lib64 -lcudart -lnccl -pthread
++//
++// Exit 0 only if correctness passes on every rank.
++
++#include <arpa/inet.h>
++#include <netinet/in.h>
++#include <sys/socket.h>
++#include <unistd.h>
++
++#include <cuda_runtime.h>
++#include <nccl.h>
++
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++#include <vector>
++
++namespace {
++
++void die(const char* msg) {
++    std::fprintf(stderr, "FATAL: %s\n", msg);
++    std::exit(2);
++}
++
++void cuda_check(cudaError_t e, const char* what) {
++    if (e != cudaSuccess) {
++        std::fprintf(stderr, "CUDA %s: %s\n", what, cudaGetErrorString(e));
++        std::exit(2);
++    }
++}
++
++void nccl_check(ncclResult_t e, const char* what) {
++    if (e != ncclSuccess) {
++        std::fprintf(stderr, "NCCL %s: %s\n", what, ncclGetErrorString(e));
++        std::exit(2);
++    }
++}
++
++bool send_all(int fd, const void* p, size_t n) {
++    const char* c = static_cast<const char*>(p);
++    size_t off = 0;
++    while (off < n) {
++        ssize_t w = ::send(fd, c + off, n - off, 0);
++        if (w <= 0) return false;
++        off += static_cast<size_t>(w);
++    }
++    return true;
++}
++
++bool recv_all(int fd, void* p, size_t n) {
++    char* c = static_cast<char*>(p);
++    size_t off = 0;
++    while (off < n) {
++        ssize_t r = ::recv(fd, c + off, n - off, 0);
++        if (r <= 0) return false;
++        off += static_cast<size_t>(r);
++    }
++    return true;
++}
++
++// Rank 0 listens; each worker receives the unique id bytes.
++void exchange_id(int rank, int world, const char* host, int port, ncclUniqueId* id) {
++    if (rank == 0) {
++        nccl_check(ncclGetUniqueId(id), "ncclGetUniqueId");
++        int ls = ::socket(AF_INET, SOCK_STREAM, 0);
++        if (ls < 0) die("socket");
++        int one = 1;
++        setsockopt(ls, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
++        sockaddr_in addr{};
++        addr.sin_family = AF_INET;
++        addr.sin_port = htons(static_cast<uint16_t>(port));
++        addr.sin_addr.s_addr = htonl(INADDR_ANY);
++        if (bind(ls, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) die("bind");
++        if (listen(ls, world) != 0) die("listen");
++        std::printf("[rank0] listening on %d, serving nccl id to %d peers\n", port, world - 1);
++        for (int i = 0; i < world - 1; ++i) {
++            int c = accept(ls, nullptr, nullptr);
++            if (c < 0) die("accept");
++            if (!send_all(c, id, sizeof(*id))) die("send id");
++            close(c);
++        }
++        close(ls);
++    } else {
++        // Retry connect briefly while rank0 binds.
++        int fd = -1;
++        for (int attempt = 0; attempt < 100; ++attempt) {
++            fd = ::socket(AF_INET, SOCK_STREAM, 0);
++            sockaddr_in addr{};
++            addr.sin_family = AF_INET;
++            addr.sin_port = htons(static_cast<uint16_t>(port));
++            if (inet_pton(AF_INET, host, &addr.sin_addr) != 1) die("inet_pton");
++            if (connect(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) == 0) break;
++            close(fd);
++            fd = -1;
++            usleep(50 * 1000);
++        }
++        if (fd < 0) die("connect to rank0");
++        if (!recv_all(fd, id, sizeof(*id))) die("recv id");
++        close(fd);
++    }
++}
++
++double bench_allreduce(ncclComm_t comm, float* buf, size_t count, int iters, cudaStream_t stream) {
++    // warmup
++    for (int i = 0; i < 10; ++i) {
++        nccl_check(ncclAllReduce(buf, buf, count, ncclFloat32, ncclSum, comm, stream), "warmup");
++    }
++    cuda_check(cudaStreamSynchronize(stream), "sync warmup");
++    auto t0 = std::chrono::steady_clock::now();
++    for (int i = 0; i < iters; ++i) {
++        nccl_check(ncclAllReduce(buf, buf, count, ncclFloat32, ncclSum, comm, stream), "bench");
++    }
++    cuda_check(cudaStreamSynchronize(stream), "sync bench");
++    auto t1 = std::chrono::steady_clock::now();
++    return std::chrono::duration<double, std::micro>(t1 - t0).count() / iters;
++}
++
++}  // namespace
++
++int main(int argc, char** argv) {
++    int rank = -1, world = 3, port = 29500, iters = 200;
++    const char* host = "127.0.0.1";
++    for (int i = 1; i < argc; ++i) {
++        std::string a = argv[i];
++        auto need = [&](const char* name) -> const char* {
++            if (i + 1 >= argc) {
++                std::fprintf(stderr, "missing value for %s\n", name);
++                std::exit(2);
++            }
++            return argv[++i];
++        };
++        if (a == "--rank") rank = std::atoi(need("--rank"));
++        else if (a == "--world") world = std::atoi(need("--world"));
++        else if (a == "--port") port = std::atoi(need("--port"));
++        else if (a == "--host") host = need("--host");
++        else if (a == "--iters") iters = std::atoi(need("--iters"));
++        else if (a == "--help") {
++            std::printf("usage: %s --rank R --world 3 [--host 127.0.0.1] [--port 29500] [--iters 200]\n",
++                        argv[0]);
++            return 0;
++        }
++    }
++    if (rank < 0 || rank >= world || world < 2) die("need --rank and --world");
++
++    // Force NVLS off on some pods (same as prior K3 work).
++    setenv("NCCL_NVLS_ENABLE", "0", 0);
++
++    int ndev = 0;
++    cuda_check(cudaGetDeviceCount(&ndev), "device count");
++    if (ndev < 1) die("no CUDA device in this process (set CUDA_VISIBLE_DEVICES)");
++    cuda_check(cudaSetDevice(0), "set device 0 (visible)");
++
++    ncclUniqueId id{};
++    exchange_id(rank, world, host, port, &id);
++
++    ncclComm_t comm = nullptr;
++    nccl_check(ncclCommInitRank(&comm, world, id, rank), "ncclCommInitRank");
++    std::printf("[rank %d/%d] ncclCommInitRank OK\n", rank, world);
++
++    cudaStream_t stream;
++    cuda_check(cudaStreamCreate(&stream), "stream");
++
++    // Correctness: each rank writes (rank+1); sum = world*(world+1)/2
++    const size_t counts[] = {7168ull, 10752ull};  // 28,672 and 43,008 bytes
++    const float expect = static_cast<float>(world * (world + 1) / 2);
++    int fails = 0;
++
++    for (size_t count : counts) {
++        float* d = nullptr;
++        cuda_check(cudaMalloc(&d, count * sizeof(float)), "malloc");
++        std::vector<float> h(count, static_cast<float>(rank + 1));
++        cuda_check(cudaMemcpy(d, h.data(), count * sizeof(float), cudaMemcpyHostToDevice), "H2D");
++        nccl_check(ncclAllReduce(d, d, count, ncclFloat32, ncclSum, comm, stream), "correctness AR");
++        cuda_check(cudaStreamSynchronize(stream), "sync corr");
++        cuda_check(cudaMemcpy(h.data(), d, count * sizeof(float), cudaMemcpyDeviceToHost), "D2H");
++        bool ok = true;
++        for (size_t i = 0; i < count; ++i) {
++            if (h[i] != expect) {
++                ok = false;
++                break;
++            }
++        }
++        const double us = bench_allreduce(comm, d, count, iters, stream);
++        std::printf("[rank %d] count=%zu bytes=%zu correct=%s p50_est_us=%.3f  (expect_sum=%.0f)\n",
++                    rank, count, count * 4, ok ? "YES" : "NO", us, expect);
++        if (!ok) ++fails;
++        // Estimate ms/token at 185 reductions of the larger payload
++        if (count == 10752ull && rank == 0) {
++            std::printf("[rank0] rough 185x reductions => %.2f ms/token collective-only @ this size\n",
++                        us * 185.0 / 1000.0);
++        }
++        cudaFree(d);
++    }
++
++    ncclCommDestroy(comm);
++    cudaStreamDestroy(stream);
++    if (fails) {
++        std::printf("[rank %d] FAIL\n", rank);
++        return 1;
++    }
++    std::printf("[rank %d] PASS\n", rank);
++    return 0;
++}
+diff --git a/runtime/include/sparkinfer/tp/rank_local_plan.h b/runtime/include/sparkinfer/tp/rank_local_plan.h
+new file mode 100644
+index 0000000..b76885b
+--- /dev/null
++++ b/runtime/include/sparkinfer/tp/rank_local_plan.h
+@@ -0,0 +1,35 @@
++#pragma once
++// Rank-local residency planning for multi-Spark TP3 (one process per host).
++// CUDA-free: decides which GGUF tensors / expert bands this rank must map.
++
++#include "sparkinfer/tp/rank_protocol.h"
++#include "sparkinfer/tp/shard.h"
++#include "sparkinfer/tp/weight_plan.h"
++
++#include <string>
++#include <vector>
++
++namespace sparkinfer {
++namespace tp {
++namespace dist {
++
++struct RankLocalPlan {
++    RankSpec spec;
++    ShardDims dims;
++    // Human-readable summary for logs / operator receipts.
++    std::string geometry_line;
++    // Estimated expert weight fraction this rank holds (0..1), geometry-only.
++    double expert_weight_fraction = 1.0;
++    // True when LM head / sampling stays only on rank 0 (correctness milestone).
++    bool full_lm_head_on_rank0_only = true;
++};
++
++// Build the TP3 (or TP4) rank-local plan. Fails closed on unsupported worlds.
++ShardError make_rank_local_plan(const RankSpec& spec, RankLocalPlan* out);
++
++// JSON-ish one line for receipts (no allocations beyond return string).
++std::string rank_local_plan_receipt(const RankLocalPlan& plan);
++
++}  // namespace dist
++}  // namespace tp
++}  // namespace sparkinfer
+diff --git a/runtime/src/tp/rank_local_plan.cpp b/runtime/src/tp/rank_local_plan.cpp
+new file mode 100644
+index 0000000..e70ae80
+--- /dev/null
++++ b/runtime/src/tp/rank_local_plan.cpp
+@@ -0,0 +1,61 @@
++#include "sparkinfer/tp/rank_local_plan.h"
++
++#include <sstream>
++
++namespace sparkinfer {
++namespace tp {
++namespace dist {
++
++ShardError make_rank_local_plan(const RankSpec& spec, RankLocalPlan* out) {
++    if (!out) return ShardError{"make_rank_local_plan: null out"};
++    RankLocalPlan p;
++    p.spec = spec;
++    const ShardError e = validate_rank_spec(spec, &p.dims);
++    if (!e.ok()) return e;
++
++    std::ostringstream geo;
++    geo << "world=" << spec.world_size << " rank=" << spec.rank
++        << " local_device=" << spec.local_device;
++    if (spec.world_size == kK3Tp3WorldSize) {
++        geo << " mode=AllExpertsFfnWidth experts=" << p.dims.n_experts
++            << " ffn_band=[" << p.dims.moe_ffn_band.offset << ","
++            << p.dims.moe_ffn_band.end() << ") ffn=" << p.dims.moe_ffn;
++        // All experts, 1/3 width.
++        p.expert_weight_fraction = 1.0 / static_cast<double>(spec.world_size);
++    } else if (spec.world_size == kK3Tp4WorldSize) {
++        geo << " mode=ExpertFfn2D eg=" << p.dims.moe_expert_groups
++            << " fs=" << p.dims.moe_ffn_shards
++            << " expert_band=[" << p.dims.expert_band.offset << ","
++            << p.dims.expert_band.end() << ") ffn_band=["
++            << p.dims.moe_ffn_band.offset << "," << p.dims.moe_ffn_band.end()
++            << ")";
++        p.expert_weight_fraction =
++            (static_cast<double>(p.dims.n_experts) / 896.0) *
++            (static_cast<double>(p.dims.moe_ffn) / 1536.0);
++    } else {
++        return ShardError{"unsupported world in make_rank_local_plan"};
++    }
++    geo << " lm_head=" << (spec.rank == 0 ? "full_on_rank0" : "skip");
++    p.geometry_line = geo.str();
++    p.full_lm_head_on_rank0_only = true;
++    *out = std::move(p);
++    return ShardError{};
++}
++
++std::string rank_local_plan_receipt(const RankLocalPlan& plan) {
++    std::ostringstream os;
++    os << "{"
++       << "\"world\":" << plan.spec.world_size << ","
++       << "\"rank\":" << plan.spec.rank << ","
++       << "\"geometry\":\"" << plan.geometry_line << "\","
++       << "\"expert_weight_fraction\":" << plan.expert_weight_fraction << ","
++       << "\"n_experts\":" << plan.dims.n_experts << ","
++       << "\"moe_ffn\":" << plan.dims.moe_ffn << ","
++       << "\"lm_head_rank0_only\":" << (plan.full_lm_head_on_rank0_only ? "true" : "false")
++       << "}";
++    return os.str();
++}
++
++}  // namespace dist
++}  // namespace tp
++}  // namespace sparkinfer
+diff --git a/runtime/tests/tp_rank_local_plan_cpu_test.cpp b/runtime/tests/tp_rank_local_plan_cpu_test.cpp
+new file mode 100644
+index 0000000..781eb0d
+--- /dev/null
++++ b/runtime/tests/tp_rank_local_plan_cpu_test.cpp
+@@ -0,0 +1,51 @@
++// CPU test for rank-local TP3/TP4 residency plan.
++
++#include "sparkinfer/tp/rank_local_plan.h"
++
++#include <cstdio>
++#include <string>
++
++using namespace sparkinfer::tp;
++using namespace sparkinfer::tp::dist;
++
++static int g_checks = 0, g_failures = 0;
++#define CHECK(c, ...) do { ++g_checks; if (!(c)) { ++g_failures; std::printf("FAIL %d: ", __LINE__); std::printf(__VA_ARGS__); std::printf("\n"); } } while(0)
++#define CHECK_EQ(a,b) CHECK((long long)(a)==(long long)(b), "got %lld want %lld", (long long)(a), (long long)(b))
++
++static RankSpec base_spec(int world, int rank) {
++    RankSpec s;
++    s.session_id = 1;
++    s.world_size = world;
++    s.rank = rank;
++    s.vocab = 163840;
++    s.model_digest[0] = 1;
++    s.plan_digest[0] = 2;
++    return s;
++}
++
++int main() {
++    for (int r = 0; r < 3; ++r) {
++        RankLocalPlan p;
++        auto e = make_rank_local_plan(base_spec(3, r), &p);
++        CHECK(e.ok(), "tp3 plan: %s", e.message.c_str());
++        CHECK_EQ(p.dims.n_experts, 896);
++        CHECK_EQ(p.dims.moe_ffn, 512);
++        CHECK_EQ(p.dims.moe_ffn_band.offset, r * 512);
++        CHECK(p.expert_weight_fraction > 0.32 && p.expert_weight_fraction < 0.34, "frac");
++        CHECK(p.full_lm_head_on_rank0_only, "lm head policy");
++        auto rec = rank_local_plan_receipt(p);
++        CHECK(rec.find("AllExpertsFfnWidth") != std::string::npos, "receipt mode");
++    }
++    for (int r = 0; r < 4; ++r) {
++        RankLocalPlan p;
++        auto e = make_rank_local_plan(base_spec(4, r), &p);
++        CHECK(e.ok(), "tp4 plan: %s", e.message.c_str());
++        CHECK_EQ(p.dims.n_experts, 448);
++        CHECK_EQ(p.dims.moe_ffn, 768);
++    }
++    RankLocalPlan bad;
++    CHECK(!make_rank_local_plan(base_spec(5, 0), &bad).ok(), "world5");
++
++    std::printf("tp_rank_local_plan_cpu_test: %d checks, %d failures\n", g_checks, g_failures);
++    return g_failures ? 1 : 0;
++}
+-- 
+2.43.0
+

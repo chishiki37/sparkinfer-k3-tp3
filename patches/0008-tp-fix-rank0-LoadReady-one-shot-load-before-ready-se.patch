@@ -1,0 +1,401 @@
+From 40f5d09e728a18de4ef625b7b38c0d633a5c7b87 Mon Sep 17 00:00:00 2001
+From: Hermes <hermes@local>
+Date: Fri, 7 Aug 2026 18:54:41 -0700
+Subject: [PATCH 08/12] tp: fix rank0 LoadReady one-shot + load-before-ready
+ sequencing
+
+CoordinatorTransport::bootstrap previously re-injected rank0 LoadReady on
+every WaitingLoadReady poll iteration. With multi-minute GB10 loads that
+produced duplicate LoadReady and aborted the cluster.
+
+Also kimi_k3_dist_generate called do_load() only AFTER bootstrap returned,
+so the synthetic rank0 LoadReady could be accepted before weights existed.
+
+Fix:
+- bootstrap(on_load) runs rank0 load once after BeginLoad/WaitingLoadReady
+- inject rank0 LoadReady exactly once, then poll workers only
+- generate passes do_load into bootstrap; 90m phase timeout for GB10 loads
+- CPU regression: duplicate LoadReady rejected
+---
+ runtime/examples/kimi_k3_dist_generate.cpp    |  22 ++-
+ .../include/sparkinfer/tp/rank_transport.h    |  11 +-
+ runtime/src/tp/rank_transport_tcp.cpp         | 141 +++++++++++-------
+ .../tp_dist_generate_protocol_cpu_test.cpp    |  89 +++++++++++
+ 4 files changed, 202 insertions(+), 61 deletions(-)
+ mode change 100755 => 100644 runtime/examples/kimi_k3_dist_generate.cpp
+ mode change 100755 => 100644 runtime/tests/tp_dist_generate_protocol_cpu_test.cpp
+
+diff --git a/runtime/examples/kimi_k3_dist_generate.cpp b/runtime/examples/kimi_k3_dist_generate.cpp
+old mode 100755
+new mode 100644
+index 5ed30be..781e79a
+--- a/runtime/examples/kimi_k3_dist_generate.cpp
++++ b/runtime/examples/kimi_k3_dist_generate.cpp
+@@ -150,8 +150,9 @@ int main(int argc, char** argv) {
+ 
+     TransportConfig tcfg;
+     tcfg.connect_timeout = std::chrono::milliseconds(120000);
+-    tcfg.recv_timeout = std::chrono::milliseconds(600000);
+-    tcfg.phase_timeout = std::chrono::milliseconds(600000);
++    // Full Neuron load on GB10 can take ~30+ minutes per rank; keep headroom.
++    tcfg.recv_timeout = std::chrono::milliseconds(5400000);   // 90 min
++    tcfg.phase_timeout = std::chrono::milliseconds(5400000);  // 90 min
+ 
+     std::string err;
+ 
+@@ -211,6 +212,8 @@ int main(int argc, char** argv) {
+         std::string nccl_err;
+         std::atomic<bool> nccl_ok{false};
+ 
++        // Load runs INSIDE bootstrap after BeginLoad / WaitingLoadReady, then rank0
++        // LoadReady is injected exactly once (see CoordinatorTransport::bootstrap).
+         if (!ctr.bootstrap(
+                 [&](NcclUniqueId* id, std::string* e) {
+                     if (!make_nccl_unique_id_bytes(id, e)) return false;
+@@ -224,6 +227,15 @@ int main(int argc, char** argv) {
+                     });
+                     return true;
+                 },
++                [&](std::string* e) {
++                    if (nccl_thr.joinable()) nccl_thr.join();
++                    if (!nccl_ok || !coll) {
++                        if (e) *e = nccl_err.empty() ? "rank0 NCCL init failed" : nccl_err;
++                        return false;
++                    }
++                    std::printf("[rank0] NCCL ready — loading weights...\n");
++                    return do_load(e);
++                },
+                 &err)) {
+             if (nccl_thr.joinable()) nccl_thr.join();
+             std::fprintf(stderr, "coord bootstrap failed: %s\n", err.c_str());
+@@ -235,12 +247,6 @@ int main(int argc, char** argv) {
+             return 1;
+         }
+ 
+-        if (!do_load(&err)) {
+-            std::fprintf(stderr, "rank0 load failed: %s\n", err.c_str());
+-            ctr.fail(err, nullptr);
+-            return 1;
+-        }
+-
+         std::vector<int> prompt;
+         if (!prompt_file.empty()) prompt = load_ids_file(prompt_file);
+         else if (!prompt_csv.empty()) prompt = parse_ids_csv(prompt_csv);
+diff --git a/runtime/include/sparkinfer/tp/rank_transport.h b/runtime/include/sparkinfer/tp/rank_transport.h
+index 6369368..1e712d8 100644
+--- a/runtime/include/sparkinfer/tp/rank_transport.h
++++ b/runtime/include/sparkinfer/tp/rank_transport.h
+@@ -119,11 +119,20 @@ public:
+     uint16_t port() const { return cfg_.port; }
+ 
+     // Accept workers, run Hello collection, install NCCL id (caller-supplied),
+-    // wait NcclReady/LoadReady, then expose ready() for begin_step loops.
++    // wait NcclReady, run rank0 on_load (if set) once, inject rank0 LoadReady
++    // exactly once, then wait for worker LoadReady until Ready.
++    //
++    // on_load mirrors RankTransport's post-BeginLoad callback: it must finish
++    // the real rank0 weight load BEFORE LoadReady is synthesized. The overload
++    // without on_load skips the load and still emits a single local LoadReady
++    // (protocol helpers only).
+     // nccl_id_provider is called once after all Hellos (typically ncclGetUniqueId
+     // or a deterministic test id).
+     bool bootstrap(const std::function<bool(NcclUniqueId*, std::string*)>& nccl_id_provider,
+                    std::string* error = nullptr);
++    bool bootstrap(const std::function<bool(NcclUniqueId*, std::string*)>& nccl_id_provider,
++                   const std::function<bool(std::string*)>& on_load,
++                   std::string* error = nullptr);
+ 
+     bool ready() const;
+     CoordinatorState state() const;
+diff --git a/runtime/src/tp/rank_transport_tcp.cpp b/runtime/src/tp/rank_transport_tcp.cpp
+index 5e18daf..e4913bd 100644
+--- a/runtime/src/tp/rank_transport_tcp.cpp
++++ b/runtime/src/tp/rank_transport_tcp.cpp
+@@ -478,6 +478,13 @@ void CoordinatorTransport::rx_loop() {
+ bool CoordinatorTransport::bootstrap(
+     const std::function<bool(NcclUniqueId*, std::string*)>& nccl_id_provider,
+     std::string* error) {
++    return bootstrap(nccl_id_provider, std::function<bool(std::string*)>{}, error);
++}
++
++bool CoordinatorTransport::bootstrap(
++    const std::function<bool(NcclUniqueId*, std::string*)>& nccl_id_provider,
++    const std::function<bool(std::string*)>& on_load,
++    std::string* error) {
+     if (cluster_.rank != 0) {
+         set_err(error, "CoordinatorTransport requires cluster.rank==0");
+         return false;
+@@ -546,10 +553,8 @@ bool CoordinatorTransport::bootstrap(
+         if (!dispatch_outbound(outbound, error)) return false;
+     }
+ 
+-    // Rank 0 marks NCCL+load ready locally without TCP.
+-    // Workers will reply over TCP; pump until Ready.
+-    // Synthesize local NcclReady + LoadReady through a temporary RankSession path
+-    // by feeding coordinator directly.
++    // Rank 0 marks NCCL ready locally without TCP.
++    // LoadReady is intentionally NOT injected here — see one-shot path after on_load.
+     {
+         Message nccl_ready;
+         nccl_ready.type = MessageType::NcclReady;
+@@ -571,7 +576,7 @@ bool CoordinatorTransport::bootstrap(
+         if (!dispatch_outbound(outbound, error)) return false;
+     }
+ 
+-    // Receive worker NcclReady messages.
++    // Receive worker NcclReady messages until WaitingLoadReady (BeginLoad sent).
+     auto wait_state = [&](CoordinatorState want) -> bool {
+         const auto deadline = std::chrono::steady_clock::now() + cfg_.phase_timeout;
+         while (coord_.state() != want && coord_.good()) {
+@@ -579,7 +584,6 @@ bool CoordinatorTransport::bootstrap(
+                 set_err(error, "phase timeout waiting for workers");
+                 return false;
+             }
+-            // Poll each worker once.
+             for (int r = 1; r < cluster_.world_size; ++r) {
+                 auto& s = sockets_[static_cast<std::size_t>(r)];
+                 if (!s) continue;
+@@ -601,59 +605,92 @@ bool CoordinatorTransport::bootstrap(
+ 
+     if (!wait_state(CoordinatorState::WaitingLoadReady) &&
+         coord_.state() != CoordinatorState::WaitingLoadReady) {
+-        // After all NcclReady, state is WaitingLoadReady OR may already have BeginLoad outbound.
+-        // install path: WaitingNcclReady -> after all ready, emits BeginLoad and WaitingLoadReady.
+         if (!coord_.good()) {
+             if (error && error->empty()) set_err(error, coord_.failure());
+             return false;
+         }
++        if (coord_.state() != CoordinatorState::WaitingLoadReady) {
++            set_err(error,
++                    std::string("expected WaitingLoadReady after NcclReady, got state=") +
++                        std::to_string(static_cast<int>(coord_.state())));
++            return false;
++        }
+     }
+-    // Continue until Ready (all LoadReady).
+-        {
+-            const auto deadline = std::chrono::steady_clock::now() + cfg_.phase_timeout;
+-            while (coord_.good() &&
+-                   coord_.state() != CoordinatorState::Ready &&
+-                   coord_.state() != CoordinatorState::Failed) {
+-                if (std::chrono::steady_clock::now() > deadline) {
+-                    set_err(error, "bootstrap phase timeout");
+-                    return false;
+-                }
+-                for (int r = 1; r < cluster_.world_size; ++r) {
+-                    auto& s = sockets_[static_cast<std::size_t>(r)];
+-                    if (!s) continue;
+-                    pollfd pfd{};
+-                    pfd.fd = s->fd();
+-                    pfd.events = POLLIN;
+-                    if (::poll(&pfd, 1, 20) <= 0) continue;
+-                    Message m;
+-                    if (!s->recv_message(&m, error)) return false;
+-                    if (!handle_inbound(r, m, error)) return false;
+-                }
+-                // Inject rank0 LoadReady when waiting for loads.
+-                if (coord_.state() == CoordinatorState::WaitingLoadReady) {
+-                    Message load_ready;
+-                    load_ready.type = MessageType::LoadReady;
+-                    load_ready.session_id = cluster_.session_id;
+-                    load_ready.rank = 0;
+-                    load_ready.world_size = cluster_.world_size;
+-                    load_ready.local_device = cluster_.local_device;
+-                    load_ready.n_experts = cluster_.n_experts;
+-                    load_ready.moe_ffn = cluster_.moe_ffn;
+-                    load_ready.expert_block_elems = cluster_.expert_block_elems;
+-                    load_ready.vocab = cluster_.vocab;
+-                    load_ready.model_digest = cluster_.model_digest;
+-                    load_ready.plan_digest = cluster_.plan_digest;
+-                    load_ready.phase = Phase::Load;
+-                    load_ready.status = 0;
+-                    std::vector<Message> outbound;
+-                    AuthenticatedPeer ap{0, 1};
+-                    std::string err;
+-                    if (coord_.accept(ap, load_ready, &outbound, &err)) {
+-                        if (!dispatch_outbound(outbound, error)) return false;
+-                    }
+-                }
++
++    // Rank0 weight load — same sequencing as RankTransport workers (after BeginLoad).
++    // MUST complete before synthesizing LoadReady, and MUST run exactly once.
++    if (on_load) {
++        std::string load_err;
++        if (!on_load(&load_err)) {
++            Message load_fail;
++            load_fail.type = MessageType::LoadReady;
++            load_fail.session_id = cluster_.session_id;
++            load_fail.rank = 0;
++            load_fail.world_size = cluster_.world_size;
++            load_fail.local_device = cluster_.local_device;
++            load_fail.n_experts = cluster_.n_experts;
++            load_fail.moe_ffn = cluster_.moe_ffn;
++            load_fail.expert_block_elems = cluster_.expert_block_elems;
++            load_fail.vocab = cluster_.vocab;
++            load_fail.model_digest = cluster_.model_digest;
++            load_fail.plan_digest = cluster_.plan_digest;
++            load_fail.phase = Phase::Load;
++            load_fail.status = 1;
++            load_fail.detail = load_err.empty() ? "rank0 load failed" : load_err;
++            std::vector<Message> outbound;
++            AuthenticatedPeer ap{0, 1};
++            std::string ignore;
++            coord_.accept(ap, load_fail, &outbound, &ignore);
++            dispatch_outbound(outbound, nullptr);
++            set_err(error, load_err.empty() ? "rank0 load failed" : load_err);
++            return false;
++        }
++    }
++
++    // Inject rank0 LoadReady exactly once (never inside the worker poll loop).
++    {
++        Message load_ready;
++        load_ready.type = MessageType::LoadReady;
++        load_ready.session_id = cluster_.session_id;
++        load_ready.rank = 0;
++        load_ready.world_size = cluster_.world_size;
++        load_ready.local_device = cluster_.local_device;
++        load_ready.n_experts = cluster_.n_experts;
++        load_ready.moe_ffn = cluster_.moe_ffn;
++        load_ready.expert_block_elems = cluster_.expert_block_elems;
++        load_ready.vocab = cluster_.vocab;
++        load_ready.model_digest = cluster_.model_digest;
++        load_ready.plan_digest = cluster_.plan_digest;
++        load_ready.phase = Phase::Load;
++        load_ready.status = 0;
++        std::vector<Message> outbound;
++        AuthenticatedPeer ap{0, 1};
++        if (!coord_.accept(ap, load_ready, &outbound, error)) return false;
++        if (!dispatch_outbound(outbound, error)) return false;
++    }
++
++    // Poll workers only until Ready. Do not re-inject rank0 LoadReady.
++    {
++        const auto deadline = std::chrono::steady_clock::now() + cfg_.phase_timeout;
++        while (coord_.good() && coord_.state() != CoordinatorState::Ready &&
++               coord_.state() != CoordinatorState::Failed) {
++            if (std::chrono::steady_clock::now() > deadline) {
++                set_err(error, "bootstrap phase timeout waiting for worker LoadReady");
++                return false;
++            }
++            for (int r = 1; r < cluster_.world_size; ++r) {
++                auto& s = sockets_[static_cast<std::size_t>(r)];
++                if (!s) continue;
++                pollfd pfd{};
++                pfd.fd = s->fd();
++                pfd.events = POLLIN;
++                if (::poll(&pfd, 1, 20) <= 0) continue;
++                Message m;
++                if (!s->recv_message(&m, error)) return false;
++                if (!handle_inbound(r, m, error)) return false;
+             }
+         }
++    }
+     if (coord_.state() != CoordinatorState::Ready) {
+         set_err(error, coord_.failure().empty() ? "bootstrap failed" : coord_.failure());
+         return false;
+diff --git a/runtime/tests/tp_dist_generate_protocol_cpu_test.cpp b/runtime/tests/tp_dist_generate_protocol_cpu_test.cpp
+old mode 100755
+new mode 100644
+index c4a1fca..59a4572
+--- a/runtime/tests/tp_dist_generate_protocol_cpu_test.cpp
++++ b/runtime/tests/tp_dist_generate_protocol_cpu_test.cpp
+@@ -59,6 +59,95 @@ int main() {
+         check(a == b && a.find("world=3") != std::string::npos, "plan identity");
+     }
+ 
++    // Coordinator: second LoadReady from same rank must abort (duplicate).
++    // Regression for Phase3 bootstrap poll-loop re-inject bug.
++    {
++        RankSpec cluster;
++        cluster.session_id = 9;
++        cluster.world_size = 3;
++        cluster.rank = 0;
++        cluster.local_device = 0;
++        cluster.n_experts = 896;
++        cluster.moe_ffn = 1536;
++        cluster.expert_block_elems = 256;
++        cluster.vocab = 163840;
++        cluster.model_digest[0] = 0x11;
++        cluster.plan_digest[0] = 0x22;
++
++        Coordinator coord(cluster);
++        std::vector<Message> out;
++        std::string err;
++        auto peer = [](int r) {
++            AuthenticatedPeer p;
++            p.rank = r;
++            p.connection_id = 1000ULL + (unsigned)r;
++            return p;
++        };
++        auto mk_hello = [&](int r) {
++            RankSession s([&] {
++                RankSpec sp = cluster;
++                sp.rank = r;
++                return sp;
++            }());
++            Message h;
++            s.hello(&h, nullptr);
++            return h;
++        };
++        for (int r = 0; r < 3; ++r) {
++            check(coord.accept(peer(r), mk_hello(r), &out, &err), "hello r");
++            out.clear();
++        }
++        NcclUniqueId id{};
++        id[0] = 7;
++        check(coord.install_nccl_unique_id(id, &out, &err), "install id");
++        out.clear();
++        for (int r = 0; r < 3; ++r) {
++            Message nr;
++            nr.type = MessageType::NcclReady;
++            nr.session_id = cluster.session_id;
++            nr.rank = r;
++            nr.world_size = 3;
++            nr.local_device = 0;
++            nr.n_experts = 896;
++            nr.moe_ffn = 1536;
++            nr.expert_block_elems = 256;
++            nr.vocab = 163840;
++            nr.model_digest = cluster.model_digest;
++            nr.plan_digest = cluster.plan_digest;
++            nr.phase = Phase::NcclInit;
++            nr.status = 0;
++            check(coord.accept(peer(r), nr, &out, &err), "nccl ready");
++            out.clear();
++        }
++        check(coord.state() == CoordinatorState::WaitingLoadReady, "waiting load");
++
++        auto mk_lr = [&](int r) {
++            Message lr;
++            lr.type = MessageType::LoadReady;
++            lr.session_id = cluster.session_id;
++            lr.rank = r;
++            lr.world_size = 3;
++            lr.local_device = 0;
++            lr.n_experts = 896;
++            lr.moe_ffn = 1536;
++            lr.expert_block_elems = 256;
++            lr.vocab = 163840;
++            lr.model_digest = cluster.model_digest;
++            lr.plan_digest = cluster.plan_digest;
++            lr.phase = Phase::Load;
++            lr.status = 0;
++            return lr;
++        };
++        check(coord.accept(peer(0), mk_lr(0), &out, &err), "rank0 load ready once");
++        out.clear();
++        // Second inject from rank0 (the old bootstrap loop bug) must fail closed.
++        check(!coord.accept(peer(0), mk_lr(0), &out, &err), "rank0 duplicate LoadReady rejected");
++        check(err.find("duplicate") != std::string::npos ||
++                  coord.failure().find("duplicate") != std::string::npos ||
++                  !coord.good(),
++              "duplicate LoadReady surfaces failure");
++    }
++
+     std::printf("tp_dist_generate_protocol_cpu_test: %d checks, %d failures\n", g_pass + g_fail,
+                 g_fail);
+     return g_fail ? 1 : 0;
+-- 
+2.43.0
+

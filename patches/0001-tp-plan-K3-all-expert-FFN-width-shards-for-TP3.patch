@@ -1,0 +1,581 @@
+From 0dc270bdee3b12a4721a641691385233fd3a6af6 Mon Sep 17 00:00:00 2001
+From: Codex Prototype <noreply@local>
+Date: Thu, 6 Aug 2026 17:49:44 -0700
+Subject: [PATCH 01/12] tp: plan K3 all-expert FFN width shards for TP3
+
+---
+ runtime/include/sparkinfer/tp/shard.h         |  26 +++
+ runtime/src/tp/shard.cpp                      |  54 ++++-
+ runtime/src/tp/weight_plan.cpp                |  47 +++-
+ runtime/src/tp/weight_residency.cpp           |  33 ++-
+ runtime/tests/CMakeLists.txt                  |  10 +
+ .../tests/tp3_all_expert_width_cpu_test.cpp   | 202 ++++++++++++++++++
+ runtime/tests/tp_shard_cpu_test.cpp           |   4 +
+ runtime/tests/tp_weight_plan_cpu_test.cpp     |  27 ++-
+ 8 files changed, 381 insertions(+), 22 deletions(-)
+ create mode 100644 runtime/tests/tp3_all_expert_width_cpu_test.cpp
+
+diff --git a/runtime/include/sparkinfer/tp/shard.h b/runtime/include/sparkinfer/tp/shard.h
+index d26e93c..c94e126 100644
+--- a/runtime/include/sparkinfer/tp/shard.h
++++ b/runtime/include/sparkinfer/tp/shard.h
+@@ -57,6 +57,18 @@ struct Band {
+     bool operator==(const Band& o) const { return offset == o.offset && extent == o.extent; }
+ };
+ 
++// How routed-expert weights are partitioned. Keep this explicit: the legacy
++// `experts_sharded` boolean can distinguish whole-expert sharding from "not
++// whole-expert", but it cannot say which matrix axis the fallback must split.
++// Treating all three expert matrices as a column shard is wrong: gate/up split
++// their OUTPUT (ne1), while down splits its INPUT (ne0).
++enum class MoeShardMode {
++    None,                  // no routed MoE, or TP=1 identity
++    WholeExperts,          // disjoint expert identities, full FFN width
++    AllExpertsFfnWidth,    // all identities on every rank, disjoint FFN bands
++    ExpertFfn2D,           // disjoint expert groups x disjoint FFN bands
++};
++
+ // Split `total` into `tp_size` bands and return rank `rank`'s.
+ //
+ // Requires exact divisibility. A ragged split is representable but poisonous for
+@@ -97,6 +109,7 @@ struct ShardDims {
+     int moe_ffn_total = 0;
+     int moe_ffn = 0;              // per-expert intermediate width, if ffn-sharded
+     bool experts_sharded = false; // false => experts replicated, ffn sharded instead
++    MoeShardMode moe_shard_mode = MoeShardMode::None;
+ 
+     // ---- 2-D MoE: expert groups x FFN band --------------------------------
+     //
+@@ -190,6 +203,19 @@ ShardError shard_dims(const ModelShape& shape, const Config& cfg, int rank,
+ ShardError moe_2d_dims(int n_experts, int moe_ffn, int tp_size, int rank,
+                        int expert_groups, int block_elems, ShardDims* d);
+ 
++// Explicit all-expert / FFN-width mode, used when the expert count does not divide
++// the TP size (K3: 896 experts over TP3). Every rank keeps every expert identity,
++// but owns a disjoint band of the intermediate width:
++//
++//   gate/up [latent, ffn, experts] split ne1 (output rows)
++//   down    [ffn, latent, experts] split ne0 (contracted input columns)
++//
++// `block_elems` is mandatory because down's ne0 is quant-blocked. The helper fails
++// before mutating `d` unless every rank gets an equal, block-aligned band. It only
++// plans metadata; loader/executor/kernel support remains a separate integration.
++ShardError moe_all_expert_width_dims(int n_experts, int moe_ffn, int tp_size, int rank,
++                                     int block_elems, ShardDims* d);
++
+ // The expert-group count to use when nobody asked for one.
+ //
+ // TWO GROUPS, NOT MORE, AND ONLY ONCE THERE ARE RANKS TO SPARE. The two costs move in
+diff --git a/runtime/src/tp/shard.cpp b/runtime/src/tp/shard.cpp
+index e82d7ba..53ba7c9 100644
+--- a/runtime/src/tp/shard.cpp
++++ b/runtime/src/tp/shard.cpp
+@@ -74,6 +74,7 @@ ShardError moe_2d_dims(int n_experts, int moe_ffn, int tp_size, int rank,
+     }
+ 
+     d->moe_2d = true;
++    d->moe_shard_mode = MoeShardMode::ExpertFfn2D;
+     d->moe_expert_groups = expert_groups;
+     d->moe_ffn_shards = fs;
+     d->expert_band = even_band(n_experts, expert_groups, rank / fs);
+@@ -86,6 +87,52 @@ ShardError moe_2d_dims(int n_experts, int moe_ffn, int tp_size, int rank,
+     return ShardError{};
+ }
+ 
++ShardError moe_all_expert_width_dims(int n_experts, int moe_ffn, int tp_size, int rank,
++                                     int block_elems, ShardDims* d) {
++    if (!d) return ShardError{"moe_all_expert_width_dims: null out"};
++    if (tp_size <= 1)
++        return ShardError{"moe_all_expert_width_dims: tp_size must be >= 2"};
++    if (rank < 0 || rank >= tp_size)
++        return ShardError{"moe_all_expert_width_dims: rank out of range"};
++    if (n_experts <= 0)
++        return ShardError{"moe_all_expert_width_dims: n_experts must be > 0"};
++    if (moe_ffn <= 0)
++        return ShardError{"moe_all_expert_width_dims: moe_ffn must be > 0"};
++    if (block_elems <= 0)
++        return ShardError{"moe_all_expert_width_dims: block_elems must be > 0"};
++    if (!divisible(moe_ffn, tp_size)) {
++        std::ostringstream os;
++        os << "moe_ffn=" << moe_ffn << " not divisible by tp_size=" << tp_size;
++        return ShardError{os.str()};
++    }
++    const int rank_ffn = moe_ffn / tp_size;
++    if ((rank_ffn % block_elems) != 0) {
++        std::ostringstream os;
++        os << "ffn shard width " << rank_ffn << " is not a multiple of the "
++           << block_elems << "-element quant block";
++        return ShardError{os.str()};
++    }
++
++    // Validate everything before mutation. A caller can safely retain its prior
++    // whole-expert descriptor when this opt-in mode is unsupported.
++    ShardDims next = *d;
++    next.tp_size = tp_size;
++    next.rank = rank;
++    next.n_experts_total = n_experts;
++    next.n_experts = n_experts;
++    next.expert_band = Band{0, n_experts};
++    next.experts_sharded = false;
++    next.moe_shard_mode = MoeShardMode::AllExpertsFfnWidth;
++    next.moe_2d = false;
++    next.moe_expert_groups = 1;
++    next.moe_ffn_shards = tp_size;
++    next.moe_ffn_total = moe_ffn;
++    next.moe_ffn_band = even_band(moe_ffn, tp_size, rank);
++    next.moe_ffn = next.moe_ffn_band.extent;
++    *d = next;
++    return ShardError{};
++}
++
+ ShardError shard_dims(const ModelShape& shape, const Config& cfg, int rank,
+                       ShardDims* out) {
+     std::ostringstream os;
+@@ -121,6 +168,7 @@ ShardError shard_dims(const ModelShape& shape, const Config& cfg, int rank,
+         d.n_experts_total = d.n_experts = shape.n_experts;
+         d.expert_band = Band{0, shape.n_experts};
+         d.experts_sharded = shape.n_experts > 0;
++        d.moe_shard_mode = MoeShardMode::None;
+         d.moe_ffn_total = d.moe_ffn = shape.moe_ffn;
+         d.dense_ffn_total = d.dense_ffn = shape.dense_ffn;
+         d.vocab_total = d.vocab = shape.vocab;
+@@ -175,6 +223,7 @@ ShardError shard_dims(const ModelShape& shape, const Config& cfg, int rank,
+     if (shape.n_experts > 0) {
+         if (divisible(shape.n_experts, cfg.tp_size)) {
+             d.experts_sharded = true;
++            d.moe_shard_mode = MoeShardMode::WholeExperts;
+             d.expert_band = even_band(shape.n_experts, cfg.tp_size, rank);
+             d.n_experts = d.expert_band.extent;
+             d.moe_ffn = shape.moe_ffn;             // full width, fewer experts
+@@ -182,9 +231,12 @@ ShardError shard_dims(const ModelShape& shape, const Config& cfg, int rank,
+             // Fallback: experts do not divide, so replicate them and split each
+             // one's intermediate width instead. Correct, just more weight traffic.
+             d.experts_sharded = false;
++            d.moe_shard_mode = MoeShardMode::AllExpertsFfnWidth;
+             d.expert_band = Band{0, shape.n_experts};
+             d.n_experts = shape.n_experts;
+-            d.moe_ffn = shape.moe_ffn / cfg.tp_size;
++            d.moe_ffn_band = even_band(shape.moe_ffn, cfg.tp_size, rank);
++            d.moe_ffn_shards = cfg.tp_size;
++            d.moe_ffn = d.moe_ffn_band.extent;
+         } else {
+             std::ostringstream m;
+             m << "neither n_experts=" << shape.n_experts << " nor moe_ffn=" << shape.moe_ffn
+diff --git a/runtime/src/tp/weight_plan.cpp b/runtime/src/tp/weight_plan.cpp
+index ccc9eb4..685a7d9 100644
+--- a/runtime/src/tp/weight_plan.cpp
++++ b/runtime/src/tp/weight_plan.cpp
+@@ -340,19 +340,48 @@ TensorPlan plan_for(const std::string& tensor_name, int rows, int cols,
+         }
+ 
+         case Rule::ExpertShard: {
+-            if (!d.experts_sharded) {
+-                // shard_dims() fell back to splitting each expert's ffn width, so
+-                // every rank holds every expert but a narrower slice of each.
+-                p.rule = Rule::ColShard;
++            if (d.moe_shard_mode == MoeShardMode::AllExpertsFfnWidth) {
++                // All expert identities remain present, but the matrix role still
++                // matters: gate/up produce the FFN band (row/ne1); down consumes it
++                // (column/ne0). A generic ColShard here silently corrupts gate/up.
++                const Rule width_rule = routed_expert_2d_rule(tensor_name);
++                if (width_rule == Rule::Unknown) {
++                    // ExpertShard is also reused for K3's head-major attn_k_b/v_b.
++                    // Those tensors are not routed experts and keep their ordinary
++                    // ne2 head-axis split.
++                    p.experts = d.expert_band;
++                    p.band = d.expert_band;
++                    break;
++                }
+                 p.experts = Band{0, d.n_experts_total};
+-                if (!divisible(cols, d.tp_size)) {
++                p.band = d.moe_ffn_band;
++                p.rule = width_rule;
++                if (p.band.extent <= 0 || p.band.end() > d.moe_ffn_total) {
+                     p.rule = Rule::Unknown;
+-                    p.note = "expert ffn-width fallback but cols not divisible";
++                    p.note = "all-expert FFN-width mode has an invalid FFN band";
+                     break;
+                 }
+-                p.band = even_band(cols, d.tp_size, d.rank);
+-                p.cols = p.band.extent;
+-                p.note = "experts not divisible by tp_size — ffn-width shard instead";
++                if (width_rule == Rule::ExpertRow2D) {
++                    if (rows != d.moe_ffn_total) {
++                        p.rule = Rule::Unknown;
++                        p.note = "gate/up output rows do not match moe_ffn_total";
++                        break;
++                    }
++                    p.rows = p.band.extent;
++                } else {
++                    if (cols != d.moe_ffn_total) {
++                        p.rule = Rule::Unknown;
++                        p.note = "down input cols do not match moe_ffn_total";
++                        break;
++                    }
++                    p.cols = p.band.extent;
++                }
++                p.note = "all experts present; FFN width sharded by matrix role";
++                break;
++            }
++            if (!d.experts_sharded) {
++                p.rule = Rule::Unknown;
++                p.note = "experts are not sharded but no explicit all-expert FFN-width mode is set";
+                 break;
+             }
+             p.experts = d.expert_band;
+diff --git a/runtime/src/tp/weight_residency.cpp b/runtime/src/tp/weight_residency.cpp
+index 698a096..89dae18 100644
+--- a/runtime/src/tp/weight_residency.cpp
++++ b/runtime/src/tp/weight_residency.cpp
+@@ -94,11 +94,27 @@ Rule resolve_rule(const std::string& name, const TensorPlan& p, Rule table_rule,
+         if (note) *note = p.note;
+         return Rule::Unknown;
+     }
+-    // shard_dims() decided the expert axis will not divide, so each rank holds every
+-    // expert but a slice of its ffn width — which is a ColShard on ne0.
++    // All-expert / FFN-width mode. The resolved rule from plan_for is deliberately
++    // role-specific: gate/up split ne1 and down splits ne0. Never collapse this to
++    // one generic column rule.
++    if (table_rule == Rule::ExpertShard &&
++        d.moe_shard_mode == MoeShardMode::AllExpertsFfnWidth) {
++        if (routed_expert_2d_rule(name) == Rule::Unknown)
++            return table_rule;  // K3 attn_k_b/v_b: ne2 is heads, not experts
++        if (p.rule != Rule::ExpertRow2D && p.rule != Rule::ExpertCol2D) {
++            *fatal_unknown = true;
++            if (note) *note = p.note.empty()
++                ? "all-expert FFN-width mode did not resolve a matrix role" : p.note;
++            return Rule::Unknown;
++        }
++        if (note) *note = p.note;
++        return p.rule;
++    }
+     if (table_rule == Rule::ExpertShard && !d.experts_sharded) {
+-        if (note) *note = "experts not divisible by tp_size — ffn-width shard instead";
+-        return Rule::ColShard;
++        *fatal_unknown = true;
++        if (note) *note =
++            "experts are not sharded but no explicit all-expert FFN-width mode is set";
++        return Rule::Unknown;
+     }
+     // 2-D MoE: the three routed-expert matrices get a SECOND band on top of the
+     // expert one. Checked after the not-divisible fallback above, so a shape that
+@@ -309,11 +325,18 @@ TensorResidency plan_tensor_residency(const std::string& name,
+                 r.note  = "2-D MoE expects ne3=1 on a routed-expert tensor";
+                 return r;
+             }
++            if (d.moe_shard_mode == MoeShardMode::AllExpertsFfnWidth &&
++                (eb.offset != 0 || eb.extent != ne2)) {
++                r.error = ResidencyError::BadShape;
++                r.note = "all-expert FFN-width mode requires every expert identity";
++                return r;
++            }
+             if (eb.extent <= 0 || fb.extent <= 0 || eb.end() > ne2) {
+                 r.error = ResidencyError::EmptyShard;
+                 r.note  = "2-D MoE band empty or past the expert axis";
+                 return r;
+             }
++            r.band = fb;
+             // One expert's matrix, in bytes. Both cases stride by this to walk the
+             // expert axis; it is also the ne1 row-run for the col case.
+             const std::size_t mat_bytes = row_bytes_full * static_cast<std::size_t>(ne1);
+@@ -355,6 +378,8 @@ TensorResidency plan_tensor_residency(const std::string& name,
+                     return r;
+                 }
+                 r.rank_ne[0] = fb.extent;
++                r.block_band.offset = fb.offset / static_cast<int>(r.block_elems);
++                r.block_band.extent = fb.extent / static_cast<int>(r.block_elems);
+                 r.copy.row_bytes  = blocked_bytes(fb.extent, r.block_elems, r.block_bytes);
+                 r.copy.src_offset = mat_bytes * static_cast<std::size_t>(eb.offset) +
+                                     static_cast<std::size_t>(fb.offset / r.block_elems) *
+diff --git a/runtime/tests/CMakeLists.txt b/runtime/tests/CMakeLists.txt
+index 0b9a56b..f122fbc 100644
+--- a/runtime/tests/CMakeLists.txt
++++ b/runtime/tests/CMakeLists.txt
+@@ -89,6 +89,16 @@ set_target_properties(tp_weight_residency_cpu_test PROPERTIES CXX_STANDARD 17)
+ target_include_directories(tp_weight_residency_cpu_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
+ add_test(NAME tp_weight_residency_cpu_test COMMAND tp_weight_residency_cpu_test)
+ 
++# K3 TP3 prototype: all 896 expert identities on each rank, with the pruned
++# 1536-wide expert FFN split 512/512/512 on the role-correct axes. Planner only;
++# no CUDA execution claim is made by this test.
++add_executable(tp3_all_expert_width_cpu_test tp3_all_expert_width_cpu_test.cpp
++               ../src/tp/weight_residency.cpp ../src/tp/weight_plan.cpp
++               ../src/tp/shard.cpp ../src/gguf.cpp)
++set_target_properties(tp3_all_expert_width_cpu_test PROPERTIES CXX_STANDARD 17)
++target_include_directories(tp3_all_expert_width_cpu_test PRIVATE ${PROJECT_SOURCE_DIR}/include)
++add_test(NAME tp3_all_expert_width_cpu_test COMMAND tp3_all_expert_width_cpu_test)
++
+ # The K3 decode schedule: op order, widths, and collective placement as DATA, so the
+ # properties that would otherwise only show up as degraded output are assertable
+ # without a GPU. Strongest check inside is the plan/manifest cross-check — two tensor
+diff --git a/runtime/tests/tp3_all_expert_width_cpu_test.cpp b/runtime/tests/tp3_all_expert_width_cpu_test.cpp
+new file mode 100644
+index 0000000..0ecf3da
+--- /dev/null
++++ b/runtime/tests/tp3_all_expert_width_cpu_test.cpp
+@@ -0,0 +1,202 @@
++// CPU-only proof for K3 TP3 routed-expert width sharding.
++//
++// This does NOT claim that the CUDA loader, executor, or kernels can consume the
++// plan. It proves the part that must be right first: all 896 expert identities are
++// present on every rank, while the 1536 intermediate width is partitioned as three
++// block-aligned 512-wide bands. Gate/up split ne1; down splits ne0.
++
++#include "sparkinfer/gguf.h"
++#include "sparkinfer/tp/shard.h"
++#include "sparkinfer/tp/weight_residency.h"
++
++#include <cstdio>
++#include <string>
++
++using namespace sparkinfer;
++using namespace sparkinfer::tp;
++
++static int g_checks = 0;
++static int g_failures = 0;
++
++#define CHECK(cond, ...)                                                          \
++    do {                                                                          \
++        ++g_checks;                                                               \
++        if (!(cond)) {                                                            \
++            ++g_failures;                                                         \
++            std::printf("FAIL %s:%d: ", __FILE__, __LINE__);                    \
++            std::printf(__VA_ARGS__);                                             \
++            std::printf("\n");                                                   \
++        }                                                                         \
++    } while (0)
++
++#define CHECK_EQ(a, b) CHECK((a) == (b), "got %lld want %lld",                  \
++                             (long long)(a), (long long)(b))
++
++enum : int { TY_IQ1_S = 19, TY_UNKNOWN = 200 };
++
++static ShardDims tp3_dims(int rank) {
++    ShardDims d;
++    d.tp_size = 3;
++    d.rank = rank;
++    d.hidden = 7168;
++    const ShardError e = moe_all_expert_width_dims(
++        /*n_experts=*/896, /*moe_ffn=*/1536, /*tp_size=*/3, rank,
++        /*block_elems=*/256, &d);
++    CHECK(e.ok(), "rank %d plan failed: %s", rank, e.message.c_str());
++    return d;
++}
++
++static void test_exact_k3_tp3_geometry() {
++    std::printf("exact_k3_tp3_geometry\n");
++    int next = 0;
++    for (int rank = 0; rank < 3; ++rank) {
++        const ShardDims d = tp3_dims(rank);
++        CHECK(d.moe_shard_mode == MoeShardMode::AllExpertsFfnWidth,
++              "rank %d mode is not AllExpertsFfnWidth", rank);
++        CHECK(!d.experts_sharded, "rank %d must not claim disjoint expert ids", rank);
++        CHECK_EQ(d.n_experts, 896);
++        CHECK_EQ(d.expert_band.offset, 0);
++        CHECK_EQ(d.expert_band.extent, 896);
++        CHECK_EQ(d.moe_ffn, 512);
++        CHECK_EQ(d.moe_ffn_band.offset, next);
++        CHECK_EQ(d.moe_ffn_band.extent, 512);
++        CHECK_EQ(d.moe_ffn_band.offset % 256, 0);
++        CHECK_EQ(d.moe_ffn_band.extent % 256, 0);
++        next = d.moe_ffn_band.end();
++    }
++    CHECK_EQ(next, 1536);
++}
++
++static void check_tensor(const char* name, const long ne[4], Rule want_rule,
++                         SplitAxis want_axis) {
++    std::size_t sum_rank_bytes = 0;
++    std::size_t full_bytes = 0;
++    int next = 0;
++    for (int rank = 0; rank < 3; ++rank) {
++        const ShardDims d = tp3_dims(rank);
++        const TensorResidency r = plan_tensor_residency(name, ne, 3, TY_IQ1_S, d);
++        CHECK(r.ok(), "%s rank %d: %s (%s)", name, rank,
++              residency_error_name(r.error), r.note.c_str());
++        if (!r.ok()) continue;
++        CHECK(r.rule == want_rule, "%s rank %d rule %s", name, rank,
++              rule_name(r.rule));
++        CHECK(r.split_axis == want_axis, "%s rank %d split axis %s", name, rank,
++              split_axis_name(r.split_axis));
++        CHECK_EQ(r.rank_ne[2], 896);
++        CHECK_EQ(r.band.offset, next);
++        CHECK_EQ(r.band.extent, 512);
++        CHECK_EQ(r.copy.total_bytes(), r.rank_bytes);
++        CHECK_EQ(r.rank_bytes * 3, r.full_bytes);
++
++        if (want_axis == SplitAxis::Ne1_Output) {
++            CHECK_EQ(r.rank_ne[0], 3584);
++            CHECK_EQ(r.rank_ne[1], 512);
++            CHECK_EQ(r.copy.n_rows, 896);
++            CHECK_EQ(r.copy.src_stride, r.full_bytes / 896);
++        } else {
++            CHECK_EQ(r.rank_ne[0], 512);
++            CHECK_EQ(r.rank_ne[1], 3584);
++            CHECK_EQ(r.block_band.offset, rank * 2);
++            CHECK_EQ(r.block_band.extent, 2);
++            CHECK_EQ(r.copy.n_rows, 3584L * 896L);
++        }
++        next = r.band.end();
++        sum_rank_bytes += r.rank_bytes;
++        full_bytes = r.full_bytes;
++    }
++    CHECK_EQ(next, 1536);
++    CHECK_EQ(sum_rank_bytes, full_bytes);
++}
++
++static void test_matrix_roles_and_conservation() {
++    std::printf("matrix_roles_and_conservation\n");
++    const long gate_up[4] = {3584, 1536, 896, 1};
++    const long down[4] = {1536, 3584, 896, 1};
++    check_tensor("blk.1.ffn_gate_exps.weight", gate_up, Rule::ExpertRow2D,
++                 SplitAxis::Ne1_Output);
++    check_tensor("blk.1.ffn_up_exps.weight", gate_up, Rule::ExpertRow2D,
++                 SplitAxis::Ne1_Output);
++    check_tensor("blk.1.ffn_down_exps.weight", down, Rule::ExpertCol2D,
++                 SplitAxis::Ne0_Input);
++}
++
++static void test_fail_closed_contract() {
++    std::printf("fail_closed_contract\n");
++    ShardDims keep;
++    keep.tp_size = 7;
++    keep.rank = 6;
++    keep.n_experts = 123;
++
++    ShardError e = moe_all_expert_width_dims(896, 1536, 4, 0, 256, &keep);
++    CHECK(!e.ok(), "1536/4=384 must fail 256-block alignment");
++    CHECK_EQ(keep.tp_size, 7);
++    CHECK_EQ(keep.n_experts, 123);
++
++    e = moe_all_expert_width_dims(896, 1600, 3, 0, 256, &keep);
++    CHECK(!e.ok(), "indivisible FFN width must fail");
++    e = moe_all_expert_width_dims(896, 1536, 3, 0, 0, &keep);
++    CHECK(!e.ok(), "unknown quant block size must fail");
++    e = moe_all_expert_width_dims(896, 1536, 3, 3, 256, &keep);
++    CHECK(!e.ok(), "out-of-range rank must fail");
++
++    const long gate_up[4] = {3584, 1536, 896, 1};
++    const long wrong_ffn[4] = {3584, 1280, 896, 1};
++    const long wrong_experts[4] = {3584, 1536, 895, 1};
++    const ShardDims d = tp3_dims(0);
++    TensorResidency r = plan_tensor_residency(
++        "blk.1.ffn_gate_exps.weight", gate_up, 3, TY_UNKNOWN, d);
++    CHECK(!r.ok() && r.error == ResidencyError::UnknownType,
++          "unsupported quant type must fail before byte planning");
++    r = plan_tensor_residency(
++        "blk.1.ffn_gate_exps.weight", wrong_ffn, 3, TY_IQ1_S, d);
++    CHECK(!r.ok() && r.error == ResidencyError::UnknownRule,
++          "a gate/up FFN shape mismatch must fail");
++    r = plan_tensor_residency(
++        "blk.1.ffn_gate_exps.weight", wrong_experts, 3, TY_IQ1_S, d);
++    CHECK(!r.ok() && r.error == ResidencyError::BadShape,
++          "missing expert identity must fail");
++
++    ShardDims ambiguous = d;
++    ambiguous.moe_shard_mode = MoeShardMode::None;
++    r = plan_tensor_residency(
++        "blk.1.ffn_gate_exps.weight", gate_up, 3, TY_IQ1_S, ambiguous);
++    CHECK(!r.ok() && r.error == ResidencyError::UnknownRule,
++          "legacy experts_sharded=false without an explicit mode must fail");
++}
++
++static void test_default_tp4_tp8_are_unchanged() {
++    std::printf("default_tp4_tp8_are_unchanged\n");
++    ModelShape s;
++    s.hidden = 7168;
++    s.n_q_heads = 96;
++    s.n_kv_heads = 1;
++    s.head_dim = 128;
++    s.vocab = 163840;
++    s.n_experts = 896;
++    s.moe_ffn = 1536;
++    for (int tp : {4, 8}) {
++        Config cfg;
++        cfg.tp_size = tp;
++        for (int rank = 0; rank < tp; ++rank) {
++            ShardDims d;
++            const ShardError e = shard_dims(s, cfg, rank, &d);
++            CHECK(e.ok(), "default tp%d rank %d failed: %s", tp, rank,
++                  e.message.c_str());
++            CHECK(d.moe_shard_mode == MoeShardMode::WholeExperts,
++                  "default tp%d must stay whole-expert", tp);
++            CHECK(d.experts_sharded, "default tp%d rank %d expert flag", tp, rank);
++            CHECK_EQ(d.n_experts, 896 / tp);
++            CHECK_EQ(d.moe_ffn, 1536);
++        }
++    }
++}
++
++int main() {
++    test_exact_k3_tp3_geometry();
++    test_matrix_roles_and_conservation();
++    test_fail_closed_contract();
++    test_default_tp4_tp8_are_unchanged();
++    std::printf("%s: %d checks, %d failures\n",
++                g_failures ? "FAIL" : "PASS", g_checks, g_failures);
++    return g_failures ? 1 : 0;
++}
+diff --git a/runtime/tests/tp_shard_cpu_test.cpp b/runtime/tests/tp_shard_cpu_test.cpp
+index b91de60..8fd1ec1 100644
+--- a/runtime/tests/tp_shard_cpu_test.cpp
++++ b/runtime/tests/tp_shard_cpu_test.cpp
+@@ -223,8 +223,12 @@ static void test_expert_fallback_to_ffn_width() {
+     ShardError e = shard_dims(s, cfg_of(8), 5, &d);
+     CHECK(e.ok(), "should fall back, not fail: %s", e.message.c_str());
+     CHECK(!d.experts_sharded, "should have fallen back to ffn-width sharding");
++    CHECK(d.moe_shard_mode == MoeShardMode::AllExpertsFfnWidth,
++          "fallback must be explicit in ShardDims");
+     CHECK_EQ(d.n_experts, 100);             // all experts on every rank
+     CHECK_EQ(d.moe_ffn, 384);               // 3072 / 8
++    CHECK_EQ(d.moe_ffn_band.offset, 5 * 384);
++    CHECK_EQ(d.moe_ffn_band.extent, 384);
+ }
+ 
+ static void test_bad_rank_and_device_list() {
+diff --git a/runtime/tests/tp_weight_plan_cpu_test.cpp b/runtime/tests/tp_weight_plan_cpu_test.cpp
+index 215dbbd..17290df 100644
+--- a/runtime/tests/tp_weight_plan_cpu_test.cpp
++++ b/runtime/tests/tp_weight_plan_cpu_test.cpp
+@@ -289,19 +289,30 @@ static void test_expert_shard_plan() {
+ static void test_expert_ffn_width_fallback() {
+     std::printf("expert_ffn_width_fallback\n");
+     // Experts don't divide but the width does: shard_dims() falls back, and the
+-    // plan must follow it to a column shard rather than staying ExpertShard with
+-    // a nonsense band.
++    // plan must preserve each matrix's role. Gate/up split their output rows;
++    // down splits its contracted input columns. Treating all three as ColShard
++    // corrupts the gate/up activation while still producing plausible shapes.
+     ModelShape s = kimi_k3();
+     s.n_experts = 100;              // 100 / 8 does not divide
+     s.moe_ffn = 3072;               // 3072 / 8 does
+     ShardDims d = dims_of(s, 8, 2);
+     CHECK(!d.experts_sharded, "should have fallen back");
+-    TensorPlan p = plan_for("blk.0.ffn_up_exps.weight", 100, 3072, d);
+-    CHECK(p.rule == Rule::ColShard, "fallback should become a col shard, got %s",
+-          rule_name(p.rule));
+-    CHECK(p.cols == 384, "3072/8: %d", p.cols);
+-    CHECK(p.experts.extent == 100, "all experts on every rank: %d", p.experts.extent);
+-    CHECK(p.note.find("ffn-width") != std::string::npos, "note: %s", p.note.c_str());
++    CHECK(d.moe_shard_mode == MoeShardMode::AllExpertsFfnWidth,
++          "fallback must carry an explicit all-expert-width mode");
++
++    TensorPlan up = plan_for("blk.0.ffn_up_exps.weight", 3072, 3584, d);
++    CHECK(up.rule == Rule::ExpertRow2D, "up should row-shard, got %s",
++          rule_name(up.rule));
++    CHECK(up.rows == 384 && up.cols == 3584, "up shard shape: %dx%d", up.rows, up.cols);
++    CHECK(up.experts.extent == 100, "all experts on every rank: %d", up.experts.extent);
++
++    TensorPlan down = plan_for("blk.0.ffn_down_exps.weight", 3584, 3072, d);
++    CHECK(down.rule == Rule::ExpertCol2D, "down should col-shard, got %s",
++          rule_name(down.rule));
++    CHECK(down.rows == 3584 && down.cols == 384,
++          "down shard shape: %dx%d", down.rows, down.cols);
++    CHECK(down.note.find("FFN width") != std::string::npos,
++          "note: %s", down.note.c_str());
+ }
+ 
+ static void test_indivisible_shapes_are_refused_at_plan_time() {
+-- 
+2.43.0
+

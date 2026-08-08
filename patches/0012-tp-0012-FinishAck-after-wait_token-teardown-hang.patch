@@ -1,0 +1,55 @@
+From 95689356e01382e2a27fbf153473c46f8bd08bf6 Mon Sep 17 00:00:00 2001
+From: Hermes <hermes@local>
+Date: Sat, 8 Aug 2026 00:43:22 -0700
+Subject: [PATCH 12/12] tp: 0012 FinishAck after wait_token (teardown hang)
+MIME-Version: 1.0
+Content-Type: text/plain; charset=UTF-8
+Content-Transfer-Encoding: 8bit
+
+Workers already consume Finish inside wait_token → FinishPending, then
+wait_finished blocked on another recv. Ack immediately when FinishPending.
+Workers now report wait_finished errors. 0011 tok/s unchanged.
+---
+ runtime/src/tp/rank_transport_tcp.cpp | 19 +++++++++++++++----
+ 1 file changed, 15 insertions(+), 4 deletions(-)
+
+diff --git a/runtime/src/tp/rank_transport_tcp.cpp b/runtime/src/tp/rank_transport_tcp.cpp
+index 6118a30..59f2e15 100644
+--- a/runtime/src/tp/rank_transport_tcp.cpp
++++ b/runtime/src/tp/rank_transport_tcp.cpp
+@@ -944,6 +944,20 @@ bool RankTransport::report_step_done(bool success, int status, const std::string
+ }
+ 
+ bool RankTransport::wait_finished(std::string* error) {
++    // Finish may already have been consumed by wait_token() (state=FinishPending).
++    // Ack immediately in that case — do not block on another recv (deadlock).
++    auto ack_if_pending = [&]() -> bool {
++        if (session_.state() != RankState::FinishPending) return false;
++        Message out;
++        if (!session_.report_finish_ack(&out, error)) return false;
++        if (!send(out, error)) return false;
++        return session_.state() == RankState::Finished;
++    };
++    if (session_.state() == RankState::Finished) return true;
++    if (session_.state() == RankState::FinishPending) {
++        return ack_if_pending();
++    }
++
+     // Drain until Finish/Abort then ack.
+     while (session_.good() && session_.state() != RankState::Finished &&
+            session_.state() != RankState::Failed) {
+@@ -954,10 +968,7 @@ bool RankTransport::wait_finished(std::string* error) {
+             if (session_.state() == RankState::Failed) return false;
+         }
+         if (session_.state() == RankState::FinishPending) {
+-            Message out;
+-            if (!session_.report_finish_ack(&out, error)) return false;
+-            if (!send(out, error)) return false;
+-            return session_.state() == RankState::Finished;
++            return ack_if_pending();
+         }
+         if (session_.state() == RankState::StepRunning) {
+             // Unexpected token while waiting finish — complete it.
+-- 
+2.43.0
+
